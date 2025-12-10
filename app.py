@@ -7,17 +7,215 @@ import schemas
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 import os
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import secrets
 
 app = FastAPI(title="Victor Springs API")
+
+# Temporary token storage for Google OAuth
+google_tokens = {}
+
+# Load environment variables
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    raise ValueError("No SECRET_KEY set in .env file")
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
 # Allow Frontend to talk to Backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Temporarily allow all origins for debugging
+    allow_origins=[FRONTEND_URL, "http://localhost:5173"],  # Allow specific origins
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# JWT Configuration
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+security = HTTPBearer()
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db),
+):
+    """Get current user from JWT token"""
+    try:
+        payload = jwt.decode(
+            credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM]
+        )
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(
+                status_code=401, detail="Invalid authentication credentials"
+            )
+        user = db.query(User).filter(User.id == int(user_id)).first()
+        if user is None:
+            raise HTTPException(status_code=401, detail="User not found")
+        return user
+    except JWTError:
+        raise HTTPException(
+            status_code=401, detail="Invalid authentication credentials"
+        )
+
+
+def create_access_token(data: dict, expires_delta: timedelta = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": int(expire.timestamp())})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+
+# --- AUTH ENDPOINTS ---
+
+
+@app.get("/login/google")
+def login_google():
+    """Redirect to Google OAuth"""
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="Google OAuth not configured")
+    google_auth_url = (
+        f"https://accounts.google.com/o/oauth2/auth?"
+        f"response_type=code&"
+        f"client_id={GOOGLE_CLIENT_ID}&"
+        f"redirect_uri=http://127.0.0.1:8000/auth/google/callback&"
+        f"scope=openid email profile&"
+        f"state=google"
+    )
+    from fastapi.responses import RedirectResponse
+
+    return RedirectResponse(google_auth_url)
+
+
+@app.get("/auth/google/callback")
+def auth_google_callback(code: str, state: str = None, db: Session = Depends(get_db)):
+    """Handle Google OAuth callback"""
+    from fastapi.responses import RedirectResponse
+
+    try:
+        # Exchange code for token
+        import requests
+
+        token_url = "https://oauth2.googleapis.com/token"
+        data = {
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "code": code,
+            "grant_type": "authorization_code",
+            "redirect_uri": "http://127.0.0.1:8000/auth/google/callback",
+        }
+        token_response = requests.post(token_url, data=data)
+        token_response.raise_for_status()
+        token_data = token_response.json()
+        access_token = token_data["access_token"]
+
+        # Get user info
+        user_info_url = "https://www.googleapis.com/oauth2/v2/userinfo"
+        headers = {"Authorization": f"Bearer {access_token}"}
+        user_response = requests.get(user_info_url, headers=headers)
+        user_response.raise_for_status()
+        user_info = user_response.json()
+
+        email = user_info["email"]
+        first_name = user_info.get("given_name", "")
+        last_name = user_info.get("family_name", "")
+
+        # Check if user exists
+        user = db.query(User).filter(User.email == email).first()
+
+        if not user:
+            # Create new user
+            user = User(
+                email=email,
+                phone_number="",  # Google users don't have phone
+                first_name=first_name,
+                last_name=last_name,
+                role=UserRole.tenant,  # Google users are tenants
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+        # Create JWT token
+        jwt_token = create_access_token(
+            data={"sub": str(user.id), "role": user.role.value}
+        )
+
+        # Store token data with a short code
+        code = secrets.token_urlsafe(16)
+        google_tokens[code] = {
+            "access_token": jwt_token,
+            "role": user.role.value,
+            "user_id": user.id,
+        }
+
+        # Redirect to frontend with code
+        redirect_url = f"{FRONTEND_URL}/google-callback?code={code}"
+        return RedirectResponse(redirect_url)
+
+    except Exception as e:
+        # On error, redirect to login
+        return RedirectResponse(f"{FRONTEND_URL}/login?error=google_auth_failed")
+
+
+@app.get("/auth/google/token")
+def get_google_token(code: str):
+    """Get Google OAuth token data by code"""
+    if code in google_tokens:
+        token_data = google_tokens.pop(code)  # Remove after use
+        return token_data
+    else:
+        raise HTTPException(status_code=404, detail="Code not found or expired")
+
+
+@app.get("/users/me")
+def get_current_user_info(current_user: User = Depends(get_current_user)):
+    """Get current user information"""
+    return {
+        "id": current_user.id,
+        "email": current_user.email,
+        "first_name": current_user.first_name,
+        "last_name": current_user.last_name,
+        "role": current_user.role.value,
+    }
+
+
+@app.post("/token")
+def login(form_data: dict, db: Session = Depends(get_db)):
+    """OAuth2 compatible token login"""
+    username = form_data.get("username")
+    password = form_data.get("password")
+
+    # For now, since no password field, just check if user exists
+    # In real app, you'd hash and check password
+    user = db.query(User).filter(User.email == username).first()
+
+    if not user:
+        raise HTTPException(status_code=400, detail="Incorrect username or password")
+
+    # Create access token
+    access_token = create_access_token(
+        data={"sub": str(user.id), "role": user.role.value}
+    )
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user_id": user.id,
+        "role": user.role.value,
+    }
+
 
 # --- GET REQUESTS (Reading Data) ---
 
