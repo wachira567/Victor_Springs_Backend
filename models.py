@@ -158,11 +158,29 @@ class Appointment(Base):
 class VacancyAlert(Base):
     __tablename__ = "vacancy_alerts"
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
+    user_id = Column(
+        Integer, ForeignKey("users.id"), nullable=True
+    )  # Allow null for guests
+    guest_id = Column(String, nullable=True)  # Random ID for guest tracking
     unit_type_id = Column(Integer, ForeignKey("unit_types.id"))
+    contact_name = Column(String, nullable=True)
+    contact_email = Column(String, nullable=True)
+    contact_phone = Column(String, nullable=True)
+    special_requests = Column(Text, nullable=True)
     valid_until = Column(Date, nullable=False)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.now)
+
+
+class SavedProperty(Base):
+    __tablename__ = "saved_properties"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    property_id = Column(Integer, ForeignKey("properties.id"))
+    created_at = Column(DateTime, default=datetime.now)
+
+    user = relationship("User")
+    property = relationship("Property")
 
 
 class Document(Base):

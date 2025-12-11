@@ -1,0 +1,16 @@
+{
+  "name": "victor-springs-notifications",
+  "version": "1.0.0",
+  "description": "WhatsApp and SMS notification service for Victor Springs",
+  "main": "whatsapp_bridge.js",
+  "scripts": {
+    "start": "node whatsapp_bridge.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "express": "^5.2.1",
+    "body-parser": "^2.2.1",
+    "qrcode-terminal": "^0.12.0",
+    "socket.io": "^4.7.5"
+  }
+}
