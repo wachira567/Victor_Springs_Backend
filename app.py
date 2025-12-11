@@ -1215,6 +1215,18 @@ def send_password_reset_endpoint(
 # --- ADMIN COMMUNICATION SETTINGS ---
 
 
+@app.get("/communication-settings")
+def get_public_communication_settings():
+    """Get public communication settings for clients"""
+    return {
+        "whatsapp_number": os.getenv("ADMIN_WHATSAPP_NUMBER", "+254754096684"),
+        "support_phone": os.getenv("SUPPORT_PHONE", "+254700000000"),
+        "support_email": os.getenv("SUPPORT_EMAIL", "support@victor-springs.com"),
+        "company_name": os.getenv("COMPANY_NAME", "Victor Springs"),
+        "floating_widget_enabled": os.getenv("FLOATING_WIDGET_ENABLED", "true").lower() == "true",
+    }
+
+
 @app.get("/admin/communication-settings")
 def get_communication_settings(current_user: User = Depends(get_current_user)):
     """Get current communication settings"""
@@ -1229,6 +1241,11 @@ def get_communication_settings(current_user: User = Depends(get_current_user)):
             "WHATSAPP_BRIDGE_URL", "http://localhost:3001"
         ),
         "test_phone": os.getenv("TEST_PHONE", ""),
+        "support_phone": os.getenv("SUPPORT_PHONE", "+254 700 000 000"),
+        "website_url": os.getenv("WEBSITE_URL", "https://victor-springs.com"),
+        "company_name": os.getenv("COMPANY_NAME", "Victor Springs"),
+        "support_email": os.getenv("SUPPORT_EMAIL", "support@victor-springs.com"),
+        "floating_widget_enabled": os.getenv("FLOATING_WIDGET_ENABLED", "true").lower() == "true",
     }
 
 
@@ -1742,6 +1759,7 @@ def update_global_settings(
         "WEBSITE_URL": settings.get("website_url", "https://victor-springs.com"),
         "COMPANY_NAME": settings.get("company_name", "Victor Springs"),
         "SUPPORT_EMAIL": settings.get("support_email", "support@victor-springs.com"),
+        "FLOATING_WIDGET_ENABLED": str(settings.get("floating_widget_enabled", True)).lower(),
     }
 
     # Update .env file
