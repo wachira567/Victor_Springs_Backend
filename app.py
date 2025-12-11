@@ -314,7 +314,66 @@ def get_current_user_info(current_user: User = Depends(get_current_user)):
         "first_name": current_user.first_name,
         "last_name": current_user.last_name,
         "role": current_user.role.value,
+        "username": current_user.first_name,  # Using first_name as username for now
+        "phone_number": current_user.phone_number,
     }
+
+
+@app.put("/users/me")
+def update_current_user_info(user_data: dict, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Update current user information"""
+    try:
+        # Update user fields
+        if "first_name" in user_data:
+            current_user.first_name = user_data["first_name"]
+        if "last_name" in user_data:
+            current_user.last_name = user_data["last_name"]
+        if "email" in user_data:
+            current_user.email = user_data["email"]
+        if "phone_number" in user_data:
+            current_user.phone_number = user_data["phone_number"]
+
+        db.commit()
+        db.refresh(current_user)
+
+        return {
+            "id": current_user.id,
+            "email": current_user.email,
+            "first_name": current_user.first_name,
+            "last_name": current_user.last_name,
+            "role": current_user.role.value,
+            "username": current_user.first_name,
+            "phone_number": current_user.phone_number,
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to update user: {str(e)}")
+
+
+@app.delete("/users/me")
+def delete_current_user(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Delete current user account"""
+    try:
+        # Delete all related data first to maintain referential integrity
+
+        # Delete saved properties
+        db.query(SavedProperty).filter(SavedProperty.user_id == current_user.id).delete()
+
+        # Delete appointments
+        db.query(Appointment).filter(Appointment.user_id == current_user.id).delete()
+
+        # Delete vacancy alerts
+        db.query(VacancyAlert).filter(VacancyAlert.user_id == current_user.id).delete()
+
+        # Finally delete the user
+        db.delete(current_user)
+        db.commit()
+
+        return {"message": "Account deleted successfully"}
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to delete account: {str(e)}")
 
 
 @app.post("/token")
@@ -1832,6 +1891,43 @@ def get_user_appointments(Authorization: str = Header(...), db: Session = Depend
     except Exception as e:
         print(f"Error fetching user appointments: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.delete("/appointments/{appointment_id}")
+def delete_user_appointment(appointment_id: int, Authorization: str = Header(...), db: Session = Depends(get_db)):
+    """Delete/cancel a user appointment"""
+    # Extract token from Authorization header
+    auth_header = Authorization
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    token = auth_header.split(" ")[1]
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+
+        # Find user
+        user = db.query(User).filter(User.id == int(user_id)).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        # Find and delete the appointment (only if it belongs to the user)
+        appointment = db.query(Appointment).filter(
+            Appointment.id == appointment_id,
+            Appointment.user_id == user.id
+        ).first()
+
+        if not appointment:
+            raise HTTPException(status_code=404, detail="Appointment not found")
+
+        db.delete(appointment)
+        db.commit()
+        return {"message": "Appointment cancelled successfully"}
+
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
 
 @app.get("/admin/property-interests")
