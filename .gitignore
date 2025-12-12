@@ -3,3 +3,10 @@ __pycache__/
 *.pyc
 .env
 .DS_Store
+
+# Node.js dependencies (notification service)
+notification_service/node_modules/
+notification_service/package-lock.json
+
+# WhatsApp authentication data (sensitive)
+notification_service/auth_info/
