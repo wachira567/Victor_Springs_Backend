@@ -1,4 +1,14 @@
-from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks, Header, Form
+from fastapi import (
+    FastAPI,
+    Depends,
+    HTTPException,
+    status,
+    BackgroundTasks,
+    Header,
+    Form,
+    UploadFile,
+    File,
+)
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session, selectinload
@@ -15,6 +25,8 @@ from models import (
     UserRole,
     AppointmentStatus,
     BookingIntent,
+    Document,
+    DocType,
 )
 import schemas
 from google.oauth2 import id_token
@@ -26,6 +38,9 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import secrets
 import sys
 import os
+import cloudinary
+import cloudinary.uploader
+import cloudinary.api
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "notification_service"))
 from notification_service import (
@@ -56,6 +71,31 @@ if not SECRET_KEY:
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+
+# Cloudinary configuration
+CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
+CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
+CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
+
+# Cloudinary Docs configuration
+CLOUDINARY_DOCS_CLOUD_NAME = os.getenv("VITE_CLOUDINARY_CLOUD_NAME_DOCS")
+CLOUDINARY_DOCS_API_KEY = os.getenv("VITE_CLOUDINARY_API_KEY_DOCS")
+CLOUDINARY_DOCS_API_SECRET = os.getenv("VITE_CLOUDINARY_API_SECRET_DOCS")
+
+if CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
+    cloudinary.config(
+        cloud_name=CLOUDINARY_CLOUD_NAME,
+        api_key=CLOUDINARY_API_KEY,
+        api_secret=CLOUDINARY_API_SECRET,
+    )
+    print("Cloudinary configured successfully")
+else:
+    print("Cloudinary not configured - image uploads will not work")
+
+if CLOUDINARY_DOCS_CLOUD_NAME and CLOUDINARY_DOCS_API_KEY and CLOUDINARY_DOCS_API_SECRET:
+    print("Cloudinary Docs configured successfully")
+else:
+    print("Cloudinary Docs not configured - PDF uploads will not work")
 
 print(f"FRONTEND_URL loaded: {FRONTEND_URL}")
 
@@ -89,7 +129,7 @@ async def add_cors_headers(request, call_next):
 # JWT Configuration
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 480  # 8 hours for development
-REFRESH_TOKEN_EXPIRE_DAYS = 7     # 7 days for user convenience
+REFRESH_TOKEN_EXPIRE_DAYS = 7  # 7 days for user convenience
 
 security = HTTPBearer()
 
@@ -107,9 +147,7 @@ def get_current_user(
         # Ensure this is an access token (for new tokens) or allow old tokens without type
         token_type = payload.get("type")
         if token_type is not None and token_type != "access":
-            raise HTTPException(
-                status_code=401, detail="Invalid token type"
-            )
+            raise HTTPException(status_code=401, detail="Invalid token type")
 
         user_id: str = payload.get("sub")
         if user_id is None:
@@ -134,23 +172,17 @@ def verify_refresh_token(token: str, db: Session = Depends(get_db)):
         # Ensure this is a refresh token (for new tokens) or allow old tokens without type
         token_type = payload.get("type")
         if token_type is not None and token_type != "refresh":
-            raise HTTPException(
-                status_code=401, detail="Invalid token type"
-            )
+            raise HTTPException(status_code=401, detail="Invalid token type")
 
         user_id: str = payload.get("sub")
         if user_id is None:
-            raise HTTPException(
-                status_code=401, detail="Invalid refresh token"
-            )
+            raise HTTPException(status_code=401, detail="Invalid refresh token")
         user = db.query(User).filter(User.id == int(user_id)).first()
         if user is None:
             raise HTTPException(status_code=401, detail="User not found")
         return user
     except JWTError:
-        raise HTTPException(
-            status_code=401, detail="Invalid refresh token"
-        )
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
 
 
 def create_access_token(data: dict, expires_delta: timedelta = None):
@@ -272,7 +304,9 @@ def auth_google_callback(code: str, state: str = None, db: Session = Depends(get
 def get_google_token(code: str):
     """Get Google OAuth token data by code"""
     if code in google_tokens:
-        token_data = google_tokens[code]  # Don't remove after use - allow multiple requests
+        token_data = google_tokens[
+            code
+        ]  # Don't remove after use - allow multiple requests
         return token_data
     else:
         raise HTTPException(status_code=404, detail="Code not found or expired")
@@ -297,13 +331,14 @@ def refresh_access_token(request: dict, db: Session = Depends(get_db)):
         return {
             "access_token": access_token,
             "token_type": "bearer",
-            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60  # seconds
+            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,  # seconds
         }
 
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
+
 
 @app.get("/users/me")
 def get_current_user_info(current_user: User = Depends(get_current_user)):
@@ -320,7 +355,11 @@ def get_current_user_info(current_user: User = Depends(get_current_user)):
 
 
 @app.put("/users/me")
-def update_current_user_info(user_data: dict, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def update_current_user_info(
+    user_data: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """Update current user information"""
     try:
         # Update user fields
@@ -351,13 +390,17 @@ def update_current_user_info(user_data: dict, current_user: User = Depends(get_c
 
 
 @app.delete("/users/me")
-def delete_current_user(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def delete_current_user(
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
     """Delete current user account"""
     try:
         # Delete all related data first to maintain referential integrity
 
         # Delete saved properties
-        db.query(SavedProperty).filter(SavedProperty.user_id == current_user.id).delete()
+        db.query(SavedProperty).filter(
+            SavedProperty.user_id == current_user.id
+        ).delete()
 
         # Delete appointments
         db.query(Appointment).filter(Appointment.user_id == current_user.id).delete()
@@ -373,11 +416,15 @@ def delete_current_user(current_user: User = Depends(get_current_user), db: Sess
 
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to delete account: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to delete account: {str(e)}"
+        )
 
 
 @app.post("/token")
-def login(username: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
+def login(
+    username: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)
+):
     """OAuth2 compatible token login with access and refresh tokens"""
 
     # For now, since no password field, just check if user exists
@@ -418,8 +465,118 @@ def get_properties(db: Session = Depends(get_db)):
     return properties
 
 
+@app.post("/properties", status_code=status.HTTP_201_CREATED)
+def create_property(
+    property_data: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Create a new property (Admin only)
+    """
+    if current_user.role.value != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        new_property = Property(
+            name=property_data.get("name"),
+            address=property_data.get("address"),
+            city=property_data.get("city"),
+            neighborhood=property_data.get("neighborhood"),
+            has_parking=property_data.get("has_parking", False),
+            has_security=property_data.get("has_security", False),
+            has_borehole=property_data.get("has_borehole", False),
+            primary_image_url=property_data.get("primary_image_url"),
+            description=property_data.get("description"),
+        )
+
+        db.add(new_property)
+        db.commit()
+        db.refresh(new_property)
+
+        return {
+            "message": "Property created successfully",
+            "property_id": new_property.id,
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to create property: {str(e)}"
+        )
+
+
+@app.put("/properties/{property_id}")
+def update_property(
+    property_id: int,
+    property_data: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Update an existing property (Admin only)
+    """
+    if current_user.role.value != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        property_obj = db.query(Property).filter(Property.id == property_id).first()
+        if not property_obj:
+            raise HTTPException(status_code=404, detail="Property not found")
+
+        # Update fields
+        for key, value in property_data.items():
+            if hasattr(property_obj, key):
+                if key in ['latitude', 'longitude'] and value is not None:
+                    setattr(property_obj, key, float(value))
+                else:
+                    setattr(property_obj, key, value)
+
+        db.commit()
+
+        return {"message": "Property updated successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to update property: {str(e)}"
+        )
+
+
+@app.delete("/properties/{property_id}")
+def delete_property(
+    property_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Delete a property (Admin only)
+    """
+    if current_user.role.value != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        property_obj = db.query(Property).filter(Property.id == property_id).first()
+        if not property_obj:
+            raise HTTPException(status_code=404, detail="Property not found")
+
+        db.delete(property_obj)
+        db.commit()
+
+        return {"message": "Property deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to delete property: {str(e)}"
+        )
+
+
 @app.get("/properties/saved")
-def get_saved_properties(Authorization: str = Header(...), db: Session = Depends(get_db)):
+def get_saved_properties(
+    Authorization: str = Header(...), db: Session = Depends(get_db)
+):
     """
     Get all properties saved by the current user.
     Based on VenueVibe's simple and working approach.
@@ -442,16 +599,23 @@ def get_saved_properties(Authorization: str = Header(...), db: Session = Depends
             return JSONResponse(content={"detail": "User not found"}, status_code=404)
 
         # Get saved property IDs first
-        saved_property_ids = db.query(SavedProperty.property_id).filter(SavedProperty.user_id == user.id).all()
+        saved_property_ids = (
+            db.query(SavedProperty.property_id)
+            .filter(SavedProperty.user_id == user.id)
+            .all()
+        )
         saved_ids = [item[0] for item in saved_property_ids]
 
         if not saved_ids:
             return JSONResponse(content=[], status_code=200)
 
         # Get property details for saved properties with images
-        properties = db.query(Property).options(
-            selectinload(Property.unit_types).selectinload(UnitType.images)
-        ).filter(Property.id.in_(saved_ids)).all()
+        properties = (
+            db.query(Property)
+            .options(selectinload(Property.unit_types).selectinload(UnitType.images))
+            .filter(Property.id.in_(saved_ids))
+            .all()
+        )
 
         result = []
         for property_obj in properties:
@@ -460,7 +624,9 @@ def get_saved_properties(Authorization: str = Header(...), db: Session = Depends
             if property_obj.unit_types:
                 for unit_type in property_obj.unit_types:
                     if unit_type.images:
-                        primary_img = next((img for img in unit_type.images if img.is_primary), None)
+                        primary_img = next(
+                            (img for img in unit_type.images if img.is_primary), None
+                        )
                         if primary_img:
                             primary_image = primary_img.image_url
                             break
@@ -470,18 +636,20 @@ def get_saved_properties(Authorization: str = Header(...), db: Session = Depends
                             break
 
             # Convert to plain dict to avoid FastAPI serialization issues
-            result.append({
-                "id": int(property_obj.id),
-                "name": str(property_obj.name or ""),
-                "slug": str(property_obj.slug or ""),
-                "address": str(property_obj.address or ""),
-                "city": str(property_obj.city or ""),
-                "neighborhood": str(property_obj.neighborhood or ""),
-                "has_parking": bool(property_obj.has_parking),
-                "has_security": bool(property_obj.has_security),
-                "has_borehole": bool(property_obj.has_borehole),
-                "primary_image": primary_image,
-            })
+            result.append(
+                {
+                    "id": int(property_obj.id),
+                    "name": str(property_obj.name or ""),
+                    "slug": str(property_obj.slug or ""),
+                    "address": str(property_obj.address or ""),
+                    "city": str(property_obj.city or ""),
+                    "neighborhood": str(property_obj.neighborhood or ""),
+                    "has_parking": bool(property_obj.has_parking),
+                    "has_security": bool(property_obj.has_security),
+                    "has_borehole": bool(property_obj.has_borehole),
+                    "primary_image": primary_image,
+                }
+            )
 
         return JSONResponse(content=result, status_code=200)
 
@@ -489,7 +657,9 @@ def get_saved_properties(Authorization: str = Header(...), db: Session = Depends
         return JSONResponse(content={"detail": "Invalid token"}, status_code=401)
     except Exception as e:
         print(f"Error fetching saved properties: {e}")
-        return JSONResponse(content={"detail": "Internal server error"}, status_code=500)
+        return JSONResponse(
+            content={"detail": "Internal server error"}, status_code=500
+        )
 
 
 @app.get("/properties/{property_id}", response_model=schemas.PropertyBase)
@@ -523,16 +693,23 @@ def get_property_detail(property_id: int, db: Session = Depends(get_db)):
             return JSONResponse(content={"detail": "User not found"}, status_code=404)
 
         # Get saved property IDs first
-        saved_property_ids = db.query(SavedProperty.property_id).filter(SavedProperty.user_id == user.id).all()
+        saved_property_ids = (
+            db.query(SavedProperty.property_id)
+            .filter(SavedProperty.user_id == user.id)
+            .all()
+        )
         saved_ids = [item[0] for item in saved_property_ids]
 
         if not saved_ids:
             return JSONResponse(content=[], status_code=200)
 
         # Get property details for saved properties with images
-        properties = db.query(Property).options(
-            selectinload(Property.unit_types).selectinload(UnitType.images)
-        ).filter(Property.id.in_(saved_ids)).all()
+        properties = (
+            db.query(Property)
+            .options(selectinload(Property.unit_types).selectinload(UnitType.images))
+            .filter(Property.id.in_(saved_ids))
+            .all()
+        )
 
         result = []
         for property_obj in properties:
@@ -541,7 +718,9 @@ def get_property_detail(property_id: int, db: Session = Depends(get_db)):
             if property_obj.unit_types:
                 for unit_type in property_obj.unit_types:
                     if unit_type.images:
-                        primary_img = next((img for img in unit_type.images if img.is_primary), None)
+                        primary_img = next(
+                            (img for img in unit_type.images if img.is_primary), None
+                        )
                         if primary_img:
                             primary_image = primary_img.image_url
                             break
@@ -551,18 +730,20 @@ def get_property_detail(property_id: int, db: Session = Depends(get_db)):
                             break
 
             # Convert to plain dict to avoid FastAPI serialization issues
-            result.append({
-                "id": int(property_obj.id),
-                "name": str(property_obj.name or ""),
-                "slug": str(property_obj.slug or ""),
-                "address": str(property_obj.address or ""),
-                "city": str(property_obj.city or ""),
-                "neighborhood": str(property_obj.neighborhood or ""),
-                "has_parking": bool(property_obj.has_parking),
-                "has_security": bool(property_obj.has_security),
-                "has_borehole": bool(property_obj.has_borehole),
-                "primary_image": primary_image,
-            })
+            result.append(
+                {
+                    "id": int(property_obj.id),
+                    "name": str(property_obj.name or ""),
+                    "slug": str(property_obj.slug or ""),
+                    "address": str(property_obj.address or ""),
+                    "city": str(property_obj.city or ""),
+                    "neighborhood": str(property_obj.neighborhood or ""),
+                    "has_parking": bool(property_obj.has_parking),
+                    "has_security": bool(property_obj.has_security),
+                    "has_borehole": bool(property_obj.has_borehole),
+                    "primary_image": primary_image,
+                }
+            )
 
         return JSONResponse(content=result, status_code=200)
 
@@ -570,7 +751,9 @@ def get_property_detail(property_id: int, db: Session = Depends(get_db)):
         return JSONResponse(content={"detail": "Invalid token"}, status_code=401)
     except Exception as e:
         print(f"Error fetching saved properties: {e}")
-        return JSONResponse(content={"detail": "Internal server error"}, status_code=500)
+        return JSONResponse(
+            content={"detail": "Internal server error"}, status_code=500
+        )
 
 
 @app.get("/properties/{property_id}/booked-dates")
@@ -590,7 +773,9 @@ def get_property_booked_dates(property_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/bookings/my-bookings")
-def get_user_bookings(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_user_bookings(
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
     """
     Get bookings for the current user.
     For now, return empty array since booking system is not fully implemented.
@@ -601,7 +786,9 @@ def get_user_bookings(current_user: User = Depends(get_current_user), db: Sessio
 
 
 @app.post("/properties/{property_id}/save", status_code=status.HTTP_201_CREATED)
-def save_property(property_id: int, Authorization: str = Header(...), db: Session = Depends(get_db)):
+def save_property(
+    property_id: int, Authorization: str = Header(...), db: Session = Depends(get_db)
+):
     """
     Save a property for the current user.
     Based on VenueVibe's approach with proper HTTP status codes.
@@ -629,10 +816,14 @@ def save_property(property_id: int, Authorization: str = Header(...), db: Sessio
             raise HTTPException(status_code=404, detail="Property not found")
 
         # Check if already saved
-        existing_save = db.query(SavedProperty).filter(
-            SavedProperty.user_id == user.id,
-            SavedProperty.property_id == property_id
-        ).first()
+        existing_save = (
+            db.query(SavedProperty)
+            .filter(
+                SavedProperty.user_id == user.id,
+                SavedProperty.property_id == property_id,
+            )
+            .first()
+        )
 
         if existing_save:
             raise HTTPException(status_code=409, detail="Property already saved")
@@ -648,7 +839,9 @@ def save_property(property_id: int, Authorization: str = Header(...), db: Sessio
 
 
 @app.delete("/properties/{property_id}/save")
-def unsave_property(property_id: int, Authorization: str = Header(...), db: Session = Depends(get_db)):
+def unsave_property(
+    property_id: int, Authorization: str = Header(...), db: Session = Depends(get_db)
+):
     """
     Remove a property from the user's saved list.
     Based on VenueVibe's approach.
@@ -671,10 +864,14 @@ def unsave_property(property_id: int, Authorization: str = Header(...), db: Sess
             raise HTTPException(status_code=404, detail="User not found")
 
         # Find and delete the saved property
-        saved_property = db.query(SavedProperty).filter(
-            SavedProperty.user_id == user.id,
-            SavedProperty.property_id == property_id
-        ).first()
+        saved_property = (
+            db.query(SavedProperty)
+            .filter(
+                SavedProperty.user_id == user.id,
+                SavedProperty.property_id == property_id,
+            )
+            .first()
+        )
 
         if not saved_property:
             raise HTTPException(status_code=404, detail="Property not saved")
@@ -688,7 +885,9 @@ def unsave_property(property_id: int, Authorization: str = Header(...), db: Sess
 
 
 @app.delete("/user/interests/{interest_id}")
-def delete_user_interest(interest_id: int, Authorization: str = Header(...), db: Session = Depends(get_db)):
+def delete_user_interest(
+    interest_id: int, Authorization: str = Header(...), db: Session = Depends(get_db)
+):
     """
     Delete a user interest.
     """
@@ -710,10 +909,11 @@ def delete_user_interest(interest_id: int, Authorization: str = Header(...), db:
             raise HTTPException(status_code=404, detail="User not found")
 
         # Find and delete the interest (only if it belongs to the user)
-        interest = db.query(VacancyAlert).filter(
-            VacancyAlert.id == interest_id,
-            VacancyAlert.user_id == user.id
-        ).first()
+        interest = (
+            db.query(VacancyAlert)
+            .filter(VacancyAlert.id == interest_id, VacancyAlert.user_id == user.id)
+            .first()
+        )
 
         if not interest:
             raise HTTPException(status_code=404, detail="Interest not found")
@@ -809,6 +1009,7 @@ def create_property_interest(request: dict, db: Session = Depends(get_db)):
         # If no user_id provided, this is a guest
         if not user_id:
             import secrets
+
             guest_id = secrets.token_urlsafe(8)  # Generate random guest ID
 
         # Validate required fields
@@ -830,7 +1031,8 @@ def create_property_interest(request: dict, db: Session = Depends(get_db)):
             contact_email=request.get("contact_email"),
             contact_phone=request.get("contact_phone"),
             special_requests=request.get("special_requests"),
-            valid_until=datetime.now().date() + timedelta(days=int(request.get("timeframe_months", 3)) * 30),
+            valid_until=datetime.now().date()
+            + timedelta(days=int(request.get("timeframe_months", 3)) * 30),
         )
 
         db.add(alert)
@@ -853,7 +1055,9 @@ def create_property_interest(request: dict, db: Session = Depends(get_db)):
                     "special_requests": request.get("special_requests", ""),
                 }
 
-                send_express_interest_notification(request["contact_phone"], interest_data)
+                send_express_interest_notification(
+                    request["contact_phone"], interest_data
+                )
             except Exception as e:
                 print(f"Failed to send interest notification: {e}")
 
@@ -869,7 +1073,9 @@ def create_property_interest(request: dict, db: Session = Depends(get_db)):
     except Exception as e:
         print(f"Failed to create property interest: {e}")
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to record interest: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to record interest: {str(e)}"
+        )
 
 
 @app.post("/site-visits", status_code=status.HTTP_201_CREATED)
@@ -1223,14 +1429,15 @@ def get_public_communication_settings():
         "support_phone": os.getenv("SUPPORT_PHONE", "+254700000000"),
         "support_email": os.getenv("SUPPORT_EMAIL", "support@victor-springs.com"),
         "company_name": os.getenv("COMPANY_NAME", "Victor Springs"),
-        "floating_widget_enabled": os.getenv("FLOATING_WIDGET_ENABLED", "true").lower() == "true",
+        "floating_widget_enabled": os.getenv("FLOATING_WIDGET_ENABLED", "true").lower()
+        == "true",
     }
 
 
 @app.get("/admin/communication-settings")
 def get_communication_settings(current_user: User = Depends(get_current_user)):
     """Get current communication settings"""
-    if current_user.role.value != "Admin":
+    if current_user.role.value != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
 
     return {
@@ -1245,7 +1452,8 @@ def get_communication_settings(current_user: User = Depends(get_current_user)):
         "website_url": os.getenv("WEBSITE_URL", "https://victor-springs.com"),
         "company_name": os.getenv("COMPANY_NAME", "Victor Springs"),
         "support_email": os.getenv("SUPPORT_EMAIL", "support@victor-springs.com"),
-        "floating_widget_enabled": os.getenv("FLOATING_WIDGET_ENABLED", "true").lower() == "true",
+        "floating_widget_enabled": os.getenv("FLOATING_WIDGET_ENABLED", "true").lower()
+        == "true",
     }
 
 
@@ -1254,7 +1462,7 @@ def update_communication_settings(
     settings: dict, current_user: User = Depends(get_current_user)
 ):
     """Update communication settings"""
-    if current_user.role.value != "Admin":
+    if current_user.role.value != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
 
     # Update environment variables (in a real app, you'd save to database)
@@ -1301,7 +1509,7 @@ def update_communication_settings(
 @app.get("/admin/whatsapp-bridge-status")
 def get_whatsapp_bridge_status(current_user: User = Depends(get_current_user)):
     """Check WhatsApp bridge connection status"""
-    if current_user.role.value != "Admin":
+    if current_user.role.value != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
 
     bridge_url = os.getenv("WHATSAPP_BRIDGE_URL", "http://localhost:3001")
@@ -1327,7 +1535,7 @@ def get_whatsapp_bridge_status(current_user: User = Depends(get_current_user)):
 @app.post("/admin/connect-whatsapp")
 def connect_whatsapp(current_user: User = Depends(get_current_user)):
     """Generate QR code for WhatsApp connection"""
-    if current_user.role.value != "Admin":
+    if current_user.role.value != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
 
     # In a real implementation, you'd trigger the bridge to generate a new QR code
@@ -1344,7 +1552,7 @@ def test_communication_connection(
     test_data: dict, current_user: User = Depends(get_current_user)
 ):
     """Test communication connection by sending a test message"""
-    if current_user.role.value != "Admin":
+    if current_user.role.value != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
 
     phone = test_data.get("phone", "")
@@ -1374,7 +1582,7 @@ def get_bookings_with_phones(
     current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     """Get bookings with user phone numbers for notification management"""
-    if current_user.role.value != "Admin":
+    if current_user.role.value != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
 
     try:
@@ -1411,7 +1619,7 @@ def send_booking_notification(
     db: Session = Depends(get_db),
 ):
     """Send notification to booking customer"""
-    if current_user.role.value != "Admin":
+    if current_user.role.value != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
 
     booking_id = notification_data.get("booking_id")
@@ -1698,7 +1906,7 @@ Questions? Call us: {support_phone}
 @app.get("/admin/message-templates")
 def get_message_templates(current_user: User = Depends(get_current_user)):
     """Get all message templates"""
-    if current_user.role.value != "Admin":
+    if current_user.role.value != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
 
     # In a real app, you'd load these from database
@@ -1713,7 +1921,7 @@ def update_message_template(
     current_user: User = Depends(get_current_user),
 ):
     """Update a specific message template"""
-    if current_user.role.value != "Admin":
+    if current_user.role.value != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
 
     if template_key not in DEFAULT_MESSAGE_TEMPLATES:
@@ -1734,7 +1942,7 @@ def update_message_template(
 @app.get("/admin/global-settings")
 def get_global_settings(current_user: User = Depends(get_current_user)):
     """Get global settings used in message templates"""
-    if current_user.role.value != "Admin":
+    if current_user.role.value != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
 
     return {
@@ -1750,7 +1958,7 @@ def update_global_settings(
     settings: dict, current_user: User = Depends(get_current_user)
 ):
     """Update global settings"""
-    if current_user.role.value != "Admin":
+    if current_user.role.value != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
 
     # Update environment variables
@@ -1759,7 +1967,9 @@ def update_global_settings(
         "WEBSITE_URL": settings.get("website_url", "https://victor-springs.com"),
         "COMPANY_NAME": settings.get("company_name", "Victor Springs"),
         "SUPPORT_EMAIL": settings.get("support_email", "support@victor-springs.com"),
-        "FLOATING_WIDGET_ENABLED": str(settings.get("floating_widget_enabled", True)).lower(),
+        "FLOATING_WIDGET_ENABLED": str(
+            settings.get("floating_widget_enabled", True)
+        ).lower(),
     }
 
     # Update .env file
@@ -1817,31 +2027,43 @@ def get_user_interests(Authorization: str = Header(...), db: Session = Depends(g
         result = []
         for interest in interests:
             # Get unit type and property info safely
-            unit_type = db.query(UnitType).filter(UnitType.id == interest.unit_type_id).first()
+            unit_type = (
+                db.query(UnitType).filter(UnitType.id == interest.unit_type_id).first()
+            )
             property_name = "Unknown Property"
             unit_type_name = "Unknown Unit"
 
             if unit_type:
                 unit_type_name = unit_type.name or "Unknown Unit"
-                property_obj = db.query(Property).filter(Property.id == unit_type.property_id).first()
+                property_obj = (
+                    db.query(Property)
+                    .filter(Property.id == unit_type.property_id)
+                    .first()
+                )
                 if property_obj:
                     property_name = property_obj.name or "Unknown Property"
 
-            result.append({
-                "id": interest.id,
-                "user_id": interest.user_id,
-                "guest_id": interest.guest_id,
-                "property_id": property_obj.id if property_obj else None,
-                "property_name": property_name,
-                "unit_type_name": unit_type_name,
-                "contact_name": interest.contact_name,
-                "contact_email": interest.contact_email,
-                "contact_phone": interest.contact_phone,
-                "timeframe_months": max(0, (interest.valid_until - datetime.now().date()).days // 30),
-                "special_requests": interest.special_requests,
-                "created_at": interest.created_at.isoformat() if interest.created_at else None,
-                "is_active": interest.is_active,
-            })
+            result.append(
+                {
+                    "id": interest.id,
+                    "user_id": interest.user_id,
+                    "guest_id": interest.guest_id,
+                    "property_id": property_obj.id if property_obj else None,
+                    "property_name": property_name,
+                    "unit_type_name": unit_type_name,
+                    "contact_name": interest.contact_name,
+                    "contact_email": interest.contact_email,
+                    "contact_phone": interest.contact_phone,
+                    "timeframe_months": max(
+                        0, (interest.valid_until - datetime.now().date()).days // 30
+                    ),
+                    "special_requests": interest.special_requests,
+                    "created_at": interest.created_at.isoformat()
+                    if interest.created_at
+                    else None,
+                    "is_active": interest.is_active,
+                }
+            )
 
         return result
 
@@ -1853,7 +2075,9 @@ def get_user_interests(Authorization: str = Header(...), db: Session = Depends(g
 
 
 @app.get("/appointments/my-appointments")
-def get_user_appointments(Authorization: str = Header(...), db: Session = Depends(get_db)):
+def get_user_appointments(
+    Authorization: str = Header(...), db: Session = Depends(get_db)
+):
     """Get appointments for the current user"""
     # Extract token from Authorization header
     auth_header = Authorization
@@ -1873,18 +2097,28 @@ def get_user_appointments(Authorization: str = Header(...), db: Session = Depend
             raise HTTPException(status_code=404, detail="User not found")
 
         # Get user's appointments with venue information
-        appointments = db.query(Appointment).filter(Appointment.user_id == user.id).all()
+        appointments = (
+            db.query(Appointment).filter(Appointment.user_id == user.id).all()
+        )
 
         # Add property information to each appointment
         result = []
         for appointment in appointments:
-            unit_type = db.query(UnitType).filter(UnitType.id == appointment.unit_type_id).first()
+            unit_type = (
+                db.query(UnitType)
+                .filter(UnitType.id == appointment.unit_type_id)
+                .first()
+            )
             property_name = "Unknown Property"
             unit_type_name = "Unknown Unit"
 
             if unit_type:
                 unit_type_name = unit_type.name or "Unknown Unit"
-                property_obj = db.query(Property).filter(Property.id == unit_type.property_id).first()
+                property_obj = (
+                    db.query(Property)
+                    .filter(Property.id == unit_type.property_id)
+                    .first()
+                )
                 if property_obj:
                     property_name = property_obj.name or "Unknown Property"
 
@@ -1892,11 +2126,15 @@ def get_user_appointments(Authorization: str = Header(...), db: Session = Depend
                 "id": appointment.id,
                 "user_id": appointment.user_id,
                 "unit_type_id": appointment.unit_type_id,
-                "appointment_date": appointment.appointment_date.isoformat() if appointment.appointment_date else None,
+                "appointment_date": appointment.appointment_date.isoformat()
+                if appointment.appointment_date
+                else None,
                 "status": appointment.status.value if appointment.status else "Pending",
                 "type": appointment.type.value if appointment.type else "viewing",
                 "admin_notes": appointment.admin_notes,
-                "created_at": appointment.created_at.isoformat() if appointment.created_at else None,
+                "created_at": appointment.created_at.isoformat()
+                if appointment.created_at
+                else None,
                 "unit_type_name": unit_type_name,
                 "property_name": property_name,
             }
@@ -1912,7 +2150,9 @@ def get_user_appointments(Authorization: str = Header(...), db: Session = Depend
 
 
 @app.delete("/appointments/{appointment_id}")
-def delete_user_appointment(appointment_id: int, Authorization: str = Header(...), db: Session = Depends(get_db)):
+def delete_user_appointment(
+    appointment_id: int, Authorization: str = Header(...), db: Session = Depends(get_db)
+):
     """Delete/cancel a user appointment"""
     # Extract token from Authorization header
     auth_header = Authorization
@@ -1932,10 +2172,11 @@ def delete_user_appointment(appointment_id: int, Authorization: str = Header(...
             raise HTTPException(status_code=404, detail="User not found")
 
         # Find and delete the appointment (only if it belongs to the user)
-        appointment = db.query(Appointment).filter(
-            Appointment.id == appointment_id,
-            Appointment.user_id == user.id
-        ).first()
+        appointment = (
+            db.query(Appointment)
+            .filter(Appointment.id == appointment_id, Appointment.user_id == user.id)
+            .first()
+        )
 
         if not appointment:
             raise HTTPException(status_code=404, detail="Appointment not found")
@@ -1949,9 +2190,11 @@ def delete_user_appointment(appointment_id: int, Authorization: str = Header(...
 
 
 @app.get("/admin/property-interests")
-def get_property_interests(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_property_interests(
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
     """Get all property interests for admin"""
-    if current_user.role.value != "Admin":
+    if current_user.role.value != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
 
     try:
@@ -1960,30 +2203,41 @@ def get_property_interests(current_user: User = Depends(get_current_user), db: S
 
         result = []
         for interest in interests:
-            result.append({
-                "id": interest.id,
-                "user_id": interest.user_id,
-                "guest_id": interest.guest_id,
-                "property_name": interest.unit_type.property.name,
-                "unit_type_name": interest.unit_type.name,
-                "contact_name": interest.contact_name,
-                "contact_email": interest.contact_email,
-                "contact_phone": interest.contact_phone,
-                "timeframe_months": (interest.valid_until - datetime.now().date()).days // 30,
-                "special_requests": interest.special_requests,
-                "created_at": interest.created_at.isoformat(),
-                "is_active": interest.is_active,
-            })
+            result.append(
+                {
+                    "id": interest.id,
+                    "user_id": interest.user_id,
+                    "guest_id": interest.guest_id,
+                    "property_name": interest.unit_type.property.name,
+                    "unit_type_name": interest.unit_type.name,
+                    "contact_name": interest.contact_name,
+                    "contact_email": interest.contact_email,
+                    "contact_phone": interest.contact_phone,
+                    "timeframe_months": (
+                        interest.valid_until - datetime.now().date()
+                    ).days
+                    // 30,
+                    "special_requests": interest.special_requests,
+                    "created_at": interest.created_at.isoformat(),
+                    "is_active": interest.is_active,
+                }
+            )
 
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch interests: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch interests: {str(e)}"
+        )
 
 
 @app.delete("/admin/property-interests/{interest_id}")
-def delete_property_interest(interest_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def delete_property_interest(
+    interest_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """Delete a property interest"""
-    if current_user.role.value != "Admin":
+    if current_user.role.value != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
 
     try:
@@ -1999,7 +2253,113 @@ def delete_property_interest(interest_id: int, current_user: User = Depends(get_
         raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to delete interest: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to delete interest: {str(e)}"
+        )
+
+
+@app.get("/admin/reports")
+def get_admin_reports(
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    """Get admin dashboard reports and statistics"""
+    if current_user.role.value != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        # Get basic counts
+        total_users = db.query(User).count()
+        total_properties = db.query(Property).count()
+        total_bookings = db.query(Appointment).count()
+        total_unit_types = db.query(UnitType).count()
+
+        # Calculate revenue (placeholder - would need payment integration)
+        revenue = 0  # Placeholder
+
+        return {
+            "stats": {
+                "users": total_users,
+                "properties": total_properties,
+                "bookings": total_bookings,
+                "venues": total_unit_types,  # Keeping "venues" for compatibility
+                "revenue": revenue,
+            }
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch reports: {str(e)}"
+        )
+
+
+@app.get("/admin/users")
+def get_all_users(
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    """Get all users for admin"""
+    if current_user.role.value != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        users = db.query(User).all()
+        result = []
+        for user in users:
+            result.append(
+                {
+                    "id": user.id,
+                    "username": user.first_name or "N/A",
+                    "email": user.email,
+                    "role": user.role.value,
+                    "created_at": user.created_at.isoformat()
+                    if user.created_at
+                    else None,
+                }
+            )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch users: {str(e)}")
+
+
+@app.get("/admin/bookings")
+def get_all_bookings(
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    """Get all bookings for admin"""
+    if current_user.role.value != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        bookings = db.query(Appointment).join(User).join(UnitType).join(Property).all()
+        result = []
+        for booking in bookings:
+            result.append(
+                {
+                    "id": booking.id,
+                    "user": f"{booking.user.first_name} {booking.user.last_name}",
+                    "venue": booking.unit_type.property.name,
+                    "event_date": booking.appointment_date.isoformat()
+                    if booking.appointment_date
+                    else None,
+                    "status": booking.status.value if booking.status else "Pending",
+                    "payment_status": "Unpaid",  # Placeholder, as payment status not implemented
+                }
+            )
+        return result
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch bookings: {str(e)}"
+        )
+
+
+@app.get("/reviews")
+def get_reviews(
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    """Get all reviews for admin moderation"""
+    if current_user.role.value != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    # Placeholder: return empty list as reviews not implemented
+    return []
 
 
 @app.post("/notifications/test")
@@ -2022,3 +2382,362 @@ def test_notifications(phone: Optional[str] = None):
         "phone": test_phone,
         "method": method,
     }
+
+
+# --- UNIT TYPE ENDPOINTS ---
+
+
+@app.post("/unit-types", status_code=status.HTTP_201_CREATED)
+def create_unit_type(
+    unit_data: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Create a new unit type (Admin only)
+    """
+    if current_user.role.value != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        new_unit = UnitType(
+            property_id=unit_data.get("property_id"),
+            name=unit_data.get("name"),
+            category=unit_data.get("category"),
+            description=unit_data.get("description"),
+            price_per_month=unit_data.get("price_per_month"),
+            deposit_amount=unit_data.get("deposit_amount"),
+            agreement_fee=unit_data.get("agreement_fee", 0),
+            garbage_fee_monthly=unit_data.get("garbage_fee_monthly", 0),
+            water_fee_monthly=unit_data.get("water_fee_monthly", 0),
+            internet_fee_monthly=unit_data.get("internet_fee_monthly", 0),
+            other_fees=unit_data.get("other_fees", 0),
+            available_units_count=unit_data.get("available_units_count"),
+        )
+
+        db.add(new_unit)
+        db.commit()
+        db.refresh(new_unit)
+
+        return {
+            "message": "Unit type created successfully",
+            "unit_type_id": new_unit.id,
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to create unit type: {str(e)}"
+        )
+
+
+@app.put("/unit-types/{unit_type_id}")
+def update_unit_type(
+    unit_type_id: int,
+    unit_data: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Update a unit type (Admin only)
+    """
+    if current_user.role.value != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        unit = db.query(UnitType).filter(UnitType.id == unit_type_id).first()
+        if not unit:
+            raise HTTPException(status_code=404, detail="Unit type not found")
+
+        # Update fields
+        for key, value in unit_data.items():
+            if hasattr(unit, key):
+                setattr(unit, key, value)
+
+        db.commit()
+
+        return {"message": "Unit type updated successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to update unit type: {str(e)}"
+        )
+
+
+@app.delete("/unit-types/{unit_type_id}")
+def delete_unit_type(
+    unit_type_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Delete a unit type (Admin only)
+    """
+    if current_user.role.value != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        unit = db.query(UnitType).filter(UnitType.id == unit_type_id).first()
+        if not unit:
+            raise HTTPException(status_code=404, detail="Unit type not found")
+
+        db.delete(unit)
+        db.commit()
+
+        return {"message": "Unit type deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to delete unit type: {str(e)}"
+        )
+
+
+# --- IMAGE UPLOAD ENDPOINT ---
+
+
+@app.post("/upload")
+async def upload_image(file: UploadFile = File(...)):
+    """
+    Upload image to Cloudinary and return the URL
+    """
+    if not CLOUDINARY_CLOUD_NAME:
+        raise HTTPException(status_code=500, detail="Image upload not configured")
+
+    try:
+        # Upload to Cloudinary
+        result = cloudinary.uploader.upload(file.file, folder="victor-springs")
+
+        return {"url": result["secure_url"], "public_id": result["public_id"]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+
+@app.post("/upload-pdf")
+async def upload_pdf(file: UploadFile = File(...)):
+    """
+    Upload PDF to Cloudinary and return the URL
+    """
+    if not CLOUDINARY_CLOUD_NAME:
+        raise HTTPException(status_code=500, detail="PDF upload not configured")
+
+    try:
+        # Upload to Cloudinary
+        result = cloudinary.uploader.upload(
+            file.file,
+            folder="victor-springs-docs",
+            resource_type="raw"
+        )
+
+        return {"url": result["secure_url"], "public_id": result["public_id"]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF upload failed: {str(e)}")
+
+
+# --- DOCUMENT MANAGEMENT ENDPOINTS ---
+
+
+@app.post("/documents")
+def create_document(
+    document_data: dict, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    """
+    Create a new document (Admin only)
+    """
+    if current_user.role.value != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        new_document = Document(
+            property_id=document_data.get("property_id"),
+            unit_type_id=document_data.get("unit_type_id"),
+            title=document_data.get("title"),
+            file_url=document_data.get("file_url"),
+            doc_type=document_data.get("doc_type", DocType.agreement),
+        )
+
+        db.add(new_document)
+        db.commit()
+        db.refresh(new_document)
+
+        return {
+            "message": "Document created successfully",
+            "document_id": new_document.id,
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to create document: {str(e)}"
+        )
+
+
+@app.get("/documents")
+def get_documents(
+    property_id: int = None,
+    unit_type_id: int = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Get documents for a property or unit type
+    """
+    try:
+        query = db.query(Document)
+
+        if property_id:
+            query = query.filter(Document.property_id == property_id)
+        if unit_type_id:
+            query = query.filter(Document.unit_type_id == unit_type_id)
+
+        documents = query.all()
+
+        result = []
+        for doc in documents:
+            result.append({
+                "id": doc.id,
+                "property_id": doc.property_id,
+                "unit_type_id": doc.unit_type_id,
+                "title": doc.title,
+                "file_url": doc.file_url,
+                "doc_type": doc.doc_type.value if doc.doc_type else None,
+            })
+
+        return result
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch documents: {str(e)}"
+        )
+
+
+@app.delete("/documents/{document_id}")
+def delete_document(
+    document_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    """
+    Delete a document (Admin only)
+    """
+    if current_user.role.value != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        document = db.query(Document).filter(Document.id == document_id).first()
+        if not document:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        db.delete(document)
+        db.commit()
+
+        return {"message": "Document deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to delete document: {str(e)}"
+        )
+
+
+# --- UNIT IMAGE ENDPOINTS ---
+
+
+@app.post("/unit-images")
+def create_unit_image(
+    image_data: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Create a new unit image association (Admin only)
+    """
+    if current_user.role.value != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        new_image = UnitImage(
+            unit_type_id=image_data.get("unit_type_id"),
+            image_url=image_data.get("image_url"),
+            is_primary=image_data.get("is_primary", False),
+        )
+
+        db.add(new_image)
+        db.commit()
+        db.refresh(new_image)
+
+        return {
+            "message": "Unit image created successfully",
+            "image_id": new_image.id,
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to create unit image: {str(e)}"
+        )
+
+
+@app.delete("/unit-images/{image_id}")
+def delete_unit_image(
+    image_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Delete a unit image (Admin only)
+    """
+    if current_user.role.value != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        image = db.query(UnitImage).filter(UnitImage.id == image_id).first()
+        if not image:
+            raise HTTPException(status_code=404, detail="Unit image not found")
+
+        db.delete(image)
+        db.commit()
+
+        return {"message": "Unit image deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to delete unit image: {str(e)}"
+        )
+
+
+@app.put("/unit-images/{image_id}/primary")
+def set_primary_image(
+    image_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Set a unit image as primary (Admin only)
+    """
+    if current_user.role.value != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        # First, unset all primary images for this unit type
+        image = db.query(UnitImage).filter(UnitImage.id == image_id).first()
+        if not image:
+            raise HTTPException(status_code=404, detail="Unit image not found")
+
+        # Unset all primary for this unit type
+        db.query(UnitImage).filter(UnitImage.unit_type_id == image.unit_type_id).update(
+            {"is_primary": False}
+        )
+
+        # Set this one as primary
+        image.is_primary = True
+        db.commit()
+
+        return {"message": "Primary image updated successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to set primary image: {str(e)}"
+        )

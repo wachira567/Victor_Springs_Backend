@@ -98,6 +98,12 @@ class Property(Base):
     has_security = Column(Boolean, default=False)
     has_borehole = Column(Boolean, default=False)
 
+    primary_image_url = Column(String)
+    description = Column(Text)
+
+    latitude = Column(Numeric(10, 8))
+    longitude = Column(Numeric(11, 8))
+
     created_at = Column(DateTime, default=datetime.now)
 
     unit_types = relationship("UnitType", back_populates="property")
