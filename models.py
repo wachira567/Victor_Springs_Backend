@@ -150,7 +150,10 @@ class UnitImage(Base):
 class Appointment(Base):
     __tablename__ = "appointments"
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
+    user_id = Column(
+        Integer, ForeignKey("users.id"), nullable=True
+    )  # Allow null for guests
+    guest_id = Column(String, nullable=True)  # Random ID for guest tracking
     unit_type_id = Column(Integer, ForeignKey("unit_types.id"))
 
     appointment_date = Column(DateTime)
@@ -159,6 +162,10 @@ class Appointment(Base):
 
     admin_notes = Column(Text)
     created_at = Column(DateTime, default=datetime.now)
+
+    # Relationships
+    user = relationship("User")
+    unit_type = relationship("UnitType")
 
 
 class VacancyAlert(Base):

@@ -11,7 +11,7 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, selectinload, joinedload
 from typing import List, Optional  # <--- CHANGED: Added this import
 from models import (
     get_db,
@@ -92,7 +92,11 @@ if CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
 else:
     print("Cloudinary not configured - image uploads will not work")
 
-if CLOUDINARY_DOCS_CLOUD_NAME and CLOUDINARY_DOCS_API_KEY and CLOUDINARY_DOCS_API_SECRET:
+if (
+    CLOUDINARY_DOCS_CLOUD_NAME
+    and CLOUDINARY_DOCS_API_KEY
+    and CLOUDINARY_DOCS_API_SECRET
+):
     print("Cloudinary Docs configured successfully")
 else:
     print("Cloudinary Docs not configured - PDF uploads will not work")
@@ -526,7 +530,7 @@ def update_property(
         # Update fields
         for key, value in property_data.items():
             if hasattr(property_obj, key) and value is not None:
-                if key in ['latitude', 'longitude']:
+                if key in ["latitude", "longitude"]:
                     if str(value).strip():
                         try:
                             setattr(property_obj, key, float(value))
@@ -679,89 +683,6 @@ def get_property_detail(property_id: int, db: Session = Depends(get_db)):
     if not property:
         raise HTTPException(status_code=404, detail="Property not found")
     return property
-    """
-    Get all properties saved by the current user.
-    Based on VenueVibe's simple and working approach.
-    """
-    # Extract token from Authorization header
-    auth_header = Authorization
-    if not auth_header or not auth_header.startswith("Bearer "):
-        return JSONResponse(content={"detail": "Not authenticated"}, status_code=401)
-
-    token = Authorization.split(" ")[1]
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = payload.get("sub")
-        if not user_id:
-            return JSONResponse(content={"detail": "Invalid token"}, status_code=401)
-
-        # Find user
-        user = db.query(User).filter(User.id == int(user_id)).first()
-        if not user:
-            return JSONResponse(content={"detail": "User not found"}, status_code=404)
-
-        # Get saved property IDs first
-        saved_property_ids = (
-            db.query(SavedProperty.property_id)
-            .filter(SavedProperty.user_id == user.id)
-            .all()
-        )
-        saved_ids = [item[0] for item in saved_property_ids]
-
-        if not saved_ids:
-            return JSONResponse(content=[], status_code=200)
-
-        # Get property details for saved properties with images
-        properties = (
-            db.query(Property)
-            .options(selectinload(Property.unit_types).selectinload(UnitType.images))
-            .filter(Property.id.in_(saved_ids))
-            .all()
-        )
-
-        result = []
-        for property_obj in properties:
-            # Get primary image for the property
-            primary_image = None
-            if property_obj.unit_types:
-                for unit_type in property_obj.unit_types:
-                    if unit_type.images:
-                        primary_img = next(
-                            (img for img in unit_type.images if img.is_primary), None
-                        )
-                        if primary_img:
-                            primary_image = primary_img.image_url
-                            break
-                        elif unit_type.images:
-                            # If no primary, use first image
-                            primary_image = unit_type.images[0].image_url
-                            break
-
-            # Convert to plain dict to avoid FastAPI serialization issues
-            result.append(
-                {
-                    "id": int(property_obj.id),
-                    "name": str(property_obj.name or ""),
-                    "slug": str(property_obj.slug or ""),
-                    "address": str(property_obj.address or ""),
-                    "city": str(property_obj.city or ""),
-                    "neighborhood": str(property_obj.neighborhood or ""),
-                    "has_parking": bool(property_obj.has_parking),
-                    "has_security": bool(property_obj.has_security),
-                    "has_borehole": bool(property_obj.has_borehole),
-                    "primary_image": primary_image,
-                }
-            )
-
-        return JSONResponse(content=result, status_code=200)
-
-    except JWTError:
-        return JSONResponse(content={"detail": "Invalid token"}, status_code=401)
-    except Exception as e:
-        print(f"Error fetching saved properties: {e}")
-        return JSONResponse(
-            content={"detail": "Internal server error"}, status_code=500
-        )
 
 
 @app.get("/properties/{property_id}/booked-dates")
@@ -1092,32 +1013,19 @@ def create_site_visit(
     db: Session = Depends(get_db),
     background_tasks: BackgroundTasks = None,
 ):
-    """Create a site visit booking"""
+    """Create a site visit booking for both registered users and guests"""
     try:
-        # 1. Get or create user
+        # 1. Get user_id or create guest_id
         user_id = request.get("user_id")
+        guest_id = None
+
         if not user_id:
-            # Create guest user if no user_id provided
-            user = User(
-                email=request.get(
-                    "contact_email",
-                    f"guest_{request.get('contact_phone')}@victor-springs.com",
-                ),
-                phone_number=request.get("contact_phone"),
-                first_name=request.get("contact_name", "").split()[0]
-                if request.get("contact_name")
-                else "",
-                last_name=" ".join(request.get("contact_name", "").split()[1:])
-                if request.get("contact_name")
-                and len(request.get("contact_name", "").split()) > 1
-                else "",
-                role=UserRole.guest,
-            )
-            db.add(user)
-            db.commit()
-            db.refresh(user)
-            user_id = user.id
+            # Generate guest ID for anonymous users
+            import secrets
+
+            guest_id = secrets.token_urlsafe(8)
         else:
+            # Verify user exists if user_id provided
             user = db.query(User).filter(User.id == user_id).first()
             if not user:
                 raise HTTPException(status_code=404, detail="User not found")
@@ -1156,6 +1064,7 @@ def create_site_visit(
 
         new_appointment = Appointment(
             user_id=user_id,
+            guest_id=guest_id,
             unit_type_id=unit_type.id,
             appointment_date=appointment_datetime,
             status=AppointmentStatus.pending,
@@ -1197,6 +1106,7 @@ def create_site_visit(
         return {
             "message": "Site visit request submitted successfully",
             "appointment_id": new_appointment.id,
+            "guest_id": guest_id,
             "notification_sent": bool(
                 background_tasks and request.get("contact_phone")
             ),
@@ -2266,6 +2176,374 @@ def delete_property_interest(
         )
 
 
+@app.get("/admin/site-visits")
+def get_site_visits(
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    """Get all site visits for admin"""
+    if current_user.role.value != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        # Get all appointments (site visits) with related data
+        appointments = (
+            db.query(Appointment)
+            .options(joinedload(Appointment.user))
+            .options(joinedload(Appointment.unit_type).joinedload(UnitType.property))
+            .all()
+        )
+
+        result = []
+        for appointment in appointments:
+            property_name = "Unknown Property"
+            unit_type_name = "Unknown Unit"
+
+            if appointment.unit_type:
+                unit_type_name = appointment.unit_type.name or "Unknown Unit"
+                if appointment.unit_type.property:
+                    property_name = (
+                        appointment.unit_type.property.name or "Unknown Property"
+                    )
+
+            # Get contact info from user or guest
+            contact_name = ""
+            contact_email = ""
+            contact_phone = ""
+            is_guest = False
+
+            if appointment.user:
+                contact_name = f"{appointment.user.first_name} {appointment.user.last_name}".strip()
+                contact_email = appointment.user.email
+                contact_phone = appointment.user.phone_number
+                is_guest = False
+            else:
+                # For guests, we don't have stored contact info, so we'll show "Guest"
+                contact_name = "Guest User"
+                contact_email = "N/A"
+                contact_phone = "N/A"
+                is_guest = True
+            # Get contact info from user or guest
+            contact_name = ""
+            contact_email = ""
+            contact_phone = ""
+
+            if appointment.user:
+                contact_name = f"{appointment.user.first_name} {appointment.user.last_name}".strip()
+                contact_email = appointment.user.email
+                contact_phone = appointment.user.phone_number
+            else:
+                # For guests, we don't have stored contact info, so we'll show "Guest"
+                contact_name = "Guest User"
+                contact_email = "N/A"
+                contact_phone = "N/A"
+
+            result.append(
+                {
+                    "id": appointment.id,
+                    "user_id": appointment.user_id,
+                    "guest_id": appointment.guest_id,
+                    "property_name": property_name,
+                    "unit_type_name": unit_type_name,
+                    "contact_name": contact_name,
+                    "contact_email": contact_email,
+                    "contact_phone": contact_phone,
+                    "appointment_date": appointment.appointment_date.isoformat()
+                    if appointment.appointment_date
+                    else None,
+                    "status": appointment.status.value
+                    if appointment.status
+                    else "pending",
+                    "type": appointment.type.value if appointment.type else "viewing",
+                    "admin_notes": appointment.admin_notes,
+                    "created_at": appointment.created_at.isoformat()
+                    if appointment.created_at
+                    else None,
+                    "is_guest": is_guest,
+                }
+            )
+
+        return result
+    except Exception as e:
+        print(f"Error in get_site_visits: {str(e)}")
+        import traceback
+
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch site visits: {str(e)}"
+        )
+
+
+@app.get("/admin/site-visits/guests")
+def get_guest_site_visits(
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    """Get guest site visits for admin"""
+    if current_user.role.value != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        # Get guest appointments (where user_id is None)
+        appointments = (
+            db.query(Appointment)
+            .options(joinedload(Appointment.unit_type).joinedload(UnitType.property))
+            .filter(Appointment.user_id.is_(None))
+            .all()
+        )
+
+        result = []
+        for appointment in appointments:
+            property_name = "Unknown Property"
+            unit_type_name = "Unknown Unit"
+
+            if appointment.unit_type:
+                unit_type_name = appointment.unit_type.name or "Unknown Unit"
+                if appointment.unit_type.property:
+                    property_name = (
+                        appointment.unit_type.property.name or "Unknown Property"
+                    )
+
+            result.append(
+                {
+                    "id": appointment.id,
+                    "user_id": appointment.user_id,
+                    "guest_id": appointment.guest_id,
+                    "property_name": property_name,
+                    "unit_type_name": unit_type_name,
+                    "contact_name": "Guest User",
+                    "contact_email": "N/A",
+                    "contact_phone": "N/A",
+                    "appointment_date": appointment.appointment_date.isoformat()
+                    if appointment.appointment_date
+                    else None,
+                    "status": appointment.status.value
+                    if appointment.status
+                    else "pending",
+                    "type": appointment.type.value if appointment.type else "viewing",
+                    "admin_notes": appointment.admin_notes,
+                    "created_at": appointment.created_at.isoformat()
+                    if appointment.created_at
+                    else None,
+                    "is_guest": True,
+                }
+            )
+
+        return result
+    except Exception as e:
+        print(f"Error in get_guest_site_visits: {str(e)}")
+        import traceback
+
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch guest site visits: {str(e)}"
+        )
+
+
+@app.get("/admin/site-visits/users")
+def get_user_site_visits(
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    """Get registered user site visits for admin"""
+    if current_user.role.value != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        # Get user appointments (where user_id is not None)
+        appointments = (
+            db.query(Appointment)
+            .options(joinedload(Appointment.user))
+            .options(joinedload(Appointment.unit_type).joinedload(UnitType.property))
+            .filter(Appointment.user_id.isnot(None))
+            .all()
+        )
+
+        result = []
+        for appointment in appointments:
+            property_name = "Unknown Property"
+            unit_type_name = "Unknown Unit"
+
+            if appointment.unit_type:
+                unit_type_name = appointment.unit_type.name or "Unknown Unit"
+                if appointment.unit_type.property:
+                    property_name = (
+                        appointment.unit_type.property.name or "Unknown Property"
+                    )
+
+            # Get contact info from user
+            contact_name = ""
+            contact_email = ""
+            contact_phone = ""
+
+            if appointment.user:
+                contact_name = f"{appointment.user.first_name} {appointment.user.last_name}".strip()
+                contact_email = appointment.user.email
+                contact_phone = appointment.user.phone_number
+
+            result.append(
+                {
+                    "id": appointment.id,
+                    "user_id": appointment.user_id,
+                    "guest_id": appointment.guest_id,
+                    "property_name": property_name,
+                    "unit_type_name": unit_type_name,
+                    "contact_name": contact_name,
+                    "contact_email": contact_email,
+                    "contact_phone": contact_phone,
+                    "appointment_date": appointment.appointment_date.isoformat()
+                    if appointment.appointment_date
+                    else None,
+                    "status": appointment.status.value
+                    if appointment.status
+                    else "pending",
+                    "type": appointment.type.value if appointment.type else "viewing",
+                    "admin_notes": appointment.admin_notes,
+                    "created_at": appointment.created_at.isoformat()
+                    if appointment.created_at
+                    else None,
+                    "is_guest": False,
+                }
+            )
+
+        return result
+    except Exception as e:
+        print(f"Error in get_user_site_visits: {str(e)}")
+        import traceback
+
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch user site visits: {str(e)}"
+        )
+
+
+@app.put("/admin/site-visits/{appointment_id}/approve")
+def approve_site_visit(
+    appointment_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    background_tasks: BackgroundTasks = None,
+):
+    """Approve a site visit and send confirmation notification"""
+    if current_user.role.value != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        appointment = (
+            db.query(Appointment).filter(Appointment.id == appointment_id).first()
+        )
+        if not appointment:
+            raise HTTPException(status_code=404, detail="Site visit not found")
+
+        # Update status to confirmed
+        appointment.status = AppointmentStatus.confirmed
+        db.commit()
+
+        # Send confirmation notification if we have contact info
+        if background_tasks:
+            # Get contact info
+            contact_name = ""
+            contact_phone = ""
+
+            if appointment.user:
+                contact_name = f"{appointment.user.first_name} {appointment.user.last_name}".strip()
+                contact_phone = appointment.user.phone_number
+            # For guests, we don't have stored contact info, so skip notification
+
+            if contact_phone and contact_name:
+                site_visit_data = {
+                    "contact_name": contact_name,
+                    "visit_date": appointment.appointment_date.strftime("%Y-%m-%d"),
+                    "visit_time": appointment.appointment_date.strftime("%H:%M"),
+                    "property_name": appointment.unit_type.property.name,
+                    "property_address": f"{appointment.unit_type.property.address}, {appointment.unit_type.property.city}"
+                    if appointment.unit_type.property.address
+                    else f"{appointment.unit_type.property.city}",
+                }
+
+                background_tasks.add_task(
+                    send_site_visit_confirmation_notification,
+                    contact_phone,
+                    site_visit_data,
+                )
+
+        return {"message": "Site visit approved successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to approve site visit: {str(e)}"
+        )
+
+
+@app.put("/admin/site-visits/{appointment_id}/decline")
+def decline_site_visit(
+    appointment_id: int,
+    request: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Decline a site visit"""
+    if current_user.role.value != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        appointment = (
+            db.query(Appointment).filter(Appointment.id == appointment_id).first()
+        )
+        if not appointment:
+            raise HTTPException(status_code=404, detail="Site visit not found")
+
+        # Update status to cancelled
+        appointment.status = AppointmentStatus.cancelled
+
+        # Add admin notes about decline reason
+        decline_reason = request.get("reason", "Declined by admin")
+        if appointment.admin_notes:
+            appointment.admin_notes += f"\nDeclined: {decline_reason}"
+        else:
+            appointment.admin_notes = f"Declined: {decline_reason}"
+
+        db.commit()
+
+        return {"message": "Site visit declined successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to decline site visit: {str(e)}"
+        )
+
+
+@app.delete("/admin/site-visits/{appointment_id}")
+def delete_site_visit(
+    appointment_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Delete a site visit"""
+    if current_user.role.value != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        appointment = (
+            db.query(Appointment).filter(Appointment.id == appointment_id).first()
+        )
+        if not appointment:
+            raise HTTPException(status_code=404, detail="Site visit not found")
+
+        db.delete(appointment)
+        db.commit()
+
+        return {"message": "Site visit deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to delete site visit: {str(e)}"
+        )
+
+
 @app.get("/admin/reports")
 def get_admin_reports(
     current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
@@ -2278,8 +2556,20 @@ def get_admin_reports(
         # Get basic counts
         total_users = db.query(User).count()
         total_properties = db.query(Property).count()
-        total_bookings = db.query(Appointment).count()
+        total_site_visits = db.query(Appointment).count()
         total_unit_types = db.query(UnitType).count()
+
+        # Get property interests this month
+        from datetime import datetime, timedelta
+
+        start_of_month = datetime.now().replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0
+        )
+        interests_this_month = (
+            db.query(VacancyAlert)
+            .filter(VacancyAlert.created_at >= start_of_month)
+            .count()
+        )
 
         # Calculate revenue (placeholder - would need payment integration)
         revenue = 0  # Placeholder
@@ -2288,12 +2578,14 @@ def get_admin_reports(
             "stats": {
                 "users": total_users,
                 "properties": total_properties,
-                "bookings": total_bookings,
+                "bookings": total_site_visits,  # Keeping "bookings" key for frontend compatibility
                 "venues": total_unit_types,  # Keeping "venues" for compatibility
                 "revenue": revenue,
+                "interests_this_month": interests_this_month,
             }
         }
     except Exception as e:
+        print(f"Error in get_admin_reports: {str(e)}")
         raise HTTPException(
             status_code=500, detail=f"Failed to fetch reports: {str(e)}"
         )
@@ -2534,9 +2826,7 @@ async def upload_pdf(file: UploadFile = File(...)):
     try:
         # Upload to Cloudinary
         result = cloudinary.uploader.upload(
-            file.file,
-            folder="victor-springs-docs",
-            resource_type="raw"
+            file.file, folder="victor-springs-docs", resource_type="raw"
         )
 
         return {"url": result["secure_url"], "public_id": result["public_id"]}
@@ -2549,7 +2839,9 @@ async def upload_pdf(file: UploadFile = File(...)):
 
 @app.post("/documents")
 def create_document(
-    document_data: dict, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+    document_data: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """
     Create a new document (Admin only)
@@ -2586,7 +2878,7 @@ def get_documents(
     property_id: int = None,
     unit_type_id: int = None,
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """
     Get documents for a property or unit type
@@ -2603,14 +2895,16 @@ def get_documents(
 
         result = []
         for doc in documents:
-            result.append({
-                "id": doc.id,
-                "property_id": doc.property_id,
-                "unit_type_id": doc.unit_type_id,
-                "title": doc.title,
-                "file_url": doc.file_url,
-                "doc_type": doc.doc_type.value if doc.doc_type else None,
-            })
+            result.append(
+                {
+                    "id": doc.id,
+                    "property_id": doc.property_id,
+                    "unit_type_id": doc.unit_type_id,
+                    "title": doc.title,
+                    "file_url": doc.file_url,
+                    "doc_type": doc.doc_type.value if doc.doc_type else None,
+                }
+            )
 
         return result
     except Exception as e:
@@ -2621,7 +2915,9 @@ def get_documents(
 
 @app.delete("/documents/{document_id}")
 def delete_document(
-    document_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+    document_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """
     Delete a document (Admin only)
