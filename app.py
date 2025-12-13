@@ -1079,10 +1079,10 @@ def create_site_visit(
             appointment_date=appointment_datetime,
             status=AppointmentStatus.pending,
             type=BookingIntent.viewing,
-            # Store guest contact info if this is a guest booking
-            guest_name=request.get("contact_name") if not user_id else None,
-            guest_email=request.get("contact_email") if not user_id else None,
-            guest_phone=request.get("contact_phone") if not user_id else None,
+            # Store contact info for both registered users and guests
+            guest_name=request.get("contact_name"),
+            guest_email=request.get("contact_email"),
+            guest_phone=request.get("contact_phone"),
             admin_notes=f"Site visit request: {request.get('special_requests', '')}",
         )
 
@@ -2363,18 +2363,22 @@ def get_site_visits(
             contact_name = ""
             contact_email = ""
             contact_phone = ""
+            contact_display = ""
             is_guest = False
 
             if appointment.user:
                 contact_name = f"{appointment.user.first_name} {appointment.user.last_name}".strip()
                 contact_email = appointment.user.email
-                contact_phone = appointment.user.phone_number
+                # Use phone from booking (guest_phone) if available, otherwise user's stored phone
+                contact_phone = appointment.guest_phone or appointment.user.phone_number or ""
+                contact_display = f"{contact_name} ({contact_phone})" if contact_phone else contact_name
                 is_guest = False
             else:
                 # For guests, use stored guest contact info
                 contact_name = appointment.guest_name or "Guest User"
                 contact_email = appointment.guest_email or "N/A"
                 contact_phone = appointment.guest_phone or "N/A"
+                contact_display = f"{contact_name} ({contact_phone})" if contact_phone != "N/A" else contact_name
                 is_guest = True
 
             # Format date and time separately
@@ -2394,6 +2398,7 @@ def get_site_visits(
                     "contact_name": contact_name,
                     "contact_email": contact_email,
                     "contact_phone": contact_phone,
+                    "contact_display": contact_display,  # Combined name and phone for display
                     "appointment_date": appointment_date,
                     "appointment_time": appointment_time,
                     "status": appointment.status.value
@@ -2451,6 +2456,10 @@ def get_guest_site_visits(
             # Format date and time separately
             appointment_date = None
             appointment_time = None
+            contact_name = appointment.guest_name or "Guest User"
+            contact_phone = appointment.guest_phone or "N/A"
+            contact_display = f"{contact_name} ({contact_phone})" if contact_phone != "N/A" else contact_name
+
             if appointment.appointment_date:
                 appointment_date = appointment.appointment_date.strftime("%Y-%m-%d")
                 appointment_time = appointment.appointment_date.strftime("%H:%M")
@@ -2462,9 +2471,10 @@ def get_guest_site_visits(
                     "guest_id": appointment.guest_id,
                     "property_name": property_name,
                     "unit_type_name": unit_type_name,
-                    "contact_name": appointment.guest_name or "Guest User",
+                    "contact_name": contact_name,
                     "contact_email": appointment.guest_email or "N/A",
-                    "contact_phone": appointment.guest_phone or "N/A",
+                    "contact_phone": contact_phone,
+                    "contact_display": contact_display,
                     "appointment_date": appointment_date,
                     "appointment_time": appointment_time,
                     "status": appointment.status.value
@@ -2524,11 +2534,14 @@ def get_user_site_visits(
             contact_name = ""
             contact_email = ""
             contact_phone = ""
+            contact_display = ""
 
             if appointment.user:
                 contact_name = f"{appointment.user.first_name} {appointment.user.last_name}".strip()
                 contact_email = appointment.user.email
-                contact_phone = appointment.user.phone_number
+                # Use phone from booking (guest_phone) if available, otherwise user's stored phone
+                contact_phone = appointment.guest_phone or appointment.user.phone_number or ""
+                contact_display = f"{contact_name} ({contact_phone})" if contact_phone else contact_name
 
             # Format date and time separately
             appointment_date = None
@@ -2547,6 +2560,7 @@ def get_user_site_visits(
                     "contact_name": contact_name,
                     "contact_email": contact_email,
                     "contact_phone": contact_phone,
+                    "contact_display": contact_display,
                     "appointment_date": appointment_date,
                     "appointment_time": appointment_time,
                     "status": appointment.status.value
@@ -2599,17 +2613,18 @@ def approve_site_visit(
         contact_phone = ""
 
         if appointment.user:
-            # Registered user
-            contact_name = (
+            # Registered user - use contact info from booking (stored in guest fields)
+            contact_name = appointment.guest_name or (
                 f"{appointment.user.first_name} {appointment.user.last_name}".strip()
             )
-            contact_phone = appointment.user.phone_number
+            contact_phone = appointment.guest_phone or appointment.user.phone_number
         else:
             # Guest user - use stored guest contact info
             contact_name = appointment.guest_name or "Valued Customer"
             contact_phone = appointment.guest_phone
 
         if contact_phone and contact_name:
+            print(f"Sending site visit confirmation to {contact_name} at {contact_phone}")
             site_visit_data = {
                 "contact_name": contact_name,
                 "visit_date": appointment.appointment_date.strftime("%Y-%m-%d"),
@@ -2627,6 +2642,8 @@ def approve_site_visit(
                 print(f"Site visit confirmation sent via {method}: {success}")
             except Exception as e:
                 print(f"Failed to send site visit confirmation: {e}")
+        else:
+            print(f"Missing contact info - Name: {contact_name}, Phone: {contact_phone}")
 
         return {"message": "Site visit approved successfully"}
     except HTTPException:
