@@ -27,6 +27,7 @@ from models import (
     BookingIntent,
     Document,
     DocType,
+    NotificationLog,
 )
 import schemas
 from google.oauth2 import id_token
@@ -904,8 +905,8 @@ def book_viewing(
     db.add(new_appointment)
     db.commit()
 
-    # 4. Send confirmation notification (if background tasks available)
-    if background_tasks and booking.phone_number:
+    # 4. Send confirmation notification synchronously
+    if booking.phone_number:
         # Get property name from unit type
         property_name = (
             unit_type.property.name if unit_type.property else "Victor Springs Venue"
@@ -917,9 +918,15 @@ def book_viewing(
             "total_cost": unit_type.price or 0,
         }
 
-        background_tasks.add_task(
-            send_booking_confirmation, booking.phone_number, booking_data
-        )
+        try:
+            success, method = send_booking_confirmation(
+                booking.phone_number, booking_data
+            )
+            notification_sent = success
+            print(f"Booking confirmation sent via {method}: {success}")
+        except Exception as e:
+            print(f"Failed to send booking confirmation: {e}")
+            notification_sent = False
 
     return {
         "message": "Appointment booked successfully",
@@ -984,11 +991,14 @@ def create_property_interest(request: dict, db: Session = Depends(get_db)):
                     "special_requests": request.get("special_requests", ""),
                 }
 
-                send_express_interest_notification(
+                success, method = send_express_interest_notification(
                     request["contact_phone"], interest_data
                 )
+                notification_sent = success
+                print(f"Express interest notification sent via {method}: {success}")
             except Exception as e:
                 print(f"Failed to send interest notification: {e}")
+                notification_sent = False
 
         return {
             "message": "Interest recorded successfully",
@@ -1090,18 +1100,16 @@ def create_site_visit(
                 "special_requests": request.get("special_requests", ""),
             }
 
-            # Use background tasks like other endpoints
-            if background_tasks:
-                background_tasks.add_task(
-                    send_site_visit_request_notification,
-                    request["contact_phone"],
-                    site_visit_data,
-                )
-            else:
-                # Fallback if background tasks not available
-                send_site_visit_request_notification(
+            # Send notification synchronously for reliability
+            try:
+                success, method = send_site_visit_request_notification(
                     request["contact_phone"], site_visit_data
                 )
+                notification_sent = success
+                print(f"Site visit notification sent via {method}: {success}")
+            except Exception as e:
+                print(f"Failed to send site visit notification: {e}")
+                notification_sent = False
 
         return {
             "message": "Site visit request submitted successfully",
@@ -1194,11 +1202,31 @@ def send_payment_reminder_notification(
 
 @app.post("/notifications/send-custom")
 def send_custom_notification_endpoint(
-    phone: str, message: str, background_tasks: BackgroundTasks
+    data: dict, background_tasks: BackgroundTasks, db: Session = Depends(get_db)
 ):
     """
     Send custom notification message
     """
+    phone = data.get("phone")
+    message = data.get("message")
+    vacancy_alert_id = data.get("vacancy_alert_id")
+
+    if not phone or not message:
+        raise HTTPException(status_code=400, detail="Phone and message are required")
+
+    # Log the notification attempt
+    if vacancy_alert_id:
+        log_entry = NotificationLog(
+            vacancy_alert_id=vacancy_alert_id,
+            message_type="custom",
+            message_content=message,
+            recipient_phone=phone,
+            delivery_method="pending",
+            success=False  # Will be updated when actually sent
+        )
+        db.add(log_entry)
+        db.commit()
+
     background_tasks.add_task(send_custom_notification, phone, message)
 
     return {"message": "Custom notification queued"}
@@ -1541,7 +1569,13 @@ def send_booking_notification(
         raise HTTPException(status_code=403, detail="Admin access required")
 
     booking_id = notification_data.get("booking_id")
+    if not booking_id:
+        raise HTTPException(status_code=400, detail="booking_id is required")
+
     notification_type = notification_data.get("type")
+    if not notification_type:
+        raise HTTPException(status_code=400, detail="type is required")
+
     custom_message = notification_data.get("custom_message", "")
 
     try:
@@ -2117,29 +2151,79 @@ def get_property_interests(
 
     try:
         # Get all vacancy alerts with related data
-        interests = db.query(VacancyAlert).join(UnitType).join(Property).all()
+        interests = (
+            db.query(VacancyAlert)
+            .options(joinedload(VacancyAlert.unit_type).joinedload(UnitType.property))
+            .all()
+        )
+
+        print(f"Found {len(interests)} vacancy alerts")
 
         result = []
         for interest in interests:
-            result.append(
-                {
-                    "id": interest.id,
-                    "user_id": interest.user_id,
-                    "guest_id": interest.guest_id,
-                    "property_name": interest.unit_type.property.name,
-                    "unit_type_name": interest.unit_type.name,
-                    "contact_name": interest.contact_name,
-                    "contact_email": interest.contact_email,
-                    "contact_phone": interest.contact_phone,
-                    "timeframe_months": (
-                        interest.valid_until - datetime.now().date()
-                    ).days
-                    // 30,
-                    "special_requests": interest.special_requests,
-                    "created_at": interest.created_at.isoformat(),
-                    "is_active": interest.is_active,
-                }
-            )
+            try:
+                # Calculate timeframe safely
+                timeframe_months = None
+                if interest.valid_until:
+                    try:
+                        timeframe_months = (
+                            interest.valid_until - datetime.now().date()
+                        ).days // 30
+                    except:
+                        timeframe_months = 0
+
+                # Format created_at safely
+                created_at_str = None
+                if interest.created_at:
+                    try:
+                        created_at_str = interest.created_at.isoformat()
+                    except:
+                        created_at_str = None
+
+                # Get notification history for this interest
+                notification_history = (
+                    db.query(NotificationLog)
+                    .filter(NotificationLog.vacancy_alert_id == interest.id)
+                    .order_by(NotificationLog.sent_at.desc())
+                    .all()
+                )
+
+                notifications = []
+                for log in notification_history:
+                    notifications.append({
+                        "id": log.id,
+                        "message_type": log.message_type,
+                        "message_content": log.message_content[:100] + "..." if len(log.message_content or "") > 100 else log.message_content,
+                        "delivery_method": log.delivery_method,
+                        "sent_at": log.sent_at.isoformat() if log.sent_at else None,
+                        "success": log.success,
+                    })
+
+                result.append(
+                    {
+                        "id": interest.id,
+                        "user_id": interest.user_id,
+                        "guest_id": interest.guest_id,
+                        "property_name": interest.unit_type.property.name
+                        if interest.unit_type and interest.unit_type.property
+                        else "Unknown Property",
+                        "unit_type_name": interest.unit_type.name
+                        if interest.unit_type
+                        else "Unknown Unit",
+                        "contact_name": interest.contact_name,
+                        "contact_email": interest.contact_email,
+                        "contact_phone": interest.contact_phone,
+                        "timeframe_months": timeframe_months,
+                        "special_requests": interest.special_requests,
+                        "created_at": created_at_str,
+                        "valid_until": interest.valid_until.isoformat() if interest.valid_until else None,
+                        "is_active": interest.is_active,
+                        "notifications": notifications,
+                    }
+                )
+            except Exception as e:
+                print(f"Error processing interest {interest.id}: {e}")
+                continue
 
         return result
     except Exception as e:

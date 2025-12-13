@@ -24,7 +24,18 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("No DATABASE_URL set in .env file")
 
-engine = create_engine(DATABASE_URL, echo=True)
+engine = create_engine(
+    DATABASE_URL,
+    echo=True,
+    pool_pre_ping=True,  # Check connection before using
+    pool_recycle=300,  # Recycle connections every 5 minutes
+    pool_size=10,  # Maximum connections in pool
+    max_overflow=20,  # Allow overflow connections
+    connect_args={
+        "connect_timeout": 10,
+        # Removed statement_timeout for Neon compatibility
+    },
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -35,6 +46,24 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+# Helper function to handle database reconnections
+def get_db_with_retry(max_retries=3):
+    """Get database session with automatic retry on connection failures"""
+    for attempt in range(max_retries):
+        try:
+            db = SessionLocal()
+            # Test the connection
+            db.execute("SELECT 1")
+            return db
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise e
+            print(f"Database connection attempt {attempt + 1} failed, retrying...")
+            import time
+
+            time.sleep(1)  # Wait 1 second before retry
 
 
 # --- 2. ENUMS ---
@@ -184,6 +213,9 @@ class VacancyAlert(Base):
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.now)
 
+    # Relationships
+    unit_type = relationship("UnitType")
+
 
 class SavedProperty(Base):
     __tablename__ = "saved_properties"
@@ -204,3 +236,18 @@ class Document(Base):
     title = Column(String)
     file_url = Column(String)
     doc_type = Column(Enum(DocType))
+
+
+class NotificationLog(Base):
+    __tablename__ = "notification_logs"
+    id = Column(Integer, primary_key=True)
+    vacancy_alert_id = Column(Integer, ForeignKey("vacancy_alerts.id"))
+    message_type = Column(String)  # 'unit_available', 'custom', etc.
+    message_content = Column(Text)
+    recipient_phone = Column(String)
+    delivery_method = Column(String)  # 'whatsapp', 'sms', 'failed'
+    sent_at = Column(DateTime, default=datetime.now)
+    success = Column(Boolean, default=True)
+
+    # Relationships
+    vacancy_alert = relationship("VacancyAlert")
