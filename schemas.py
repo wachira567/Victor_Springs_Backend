@@ -46,6 +46,10 @@ class PropertyBase(BaseModel):
     has_parking: bool = False
     has_security: bool = False
     has_borehole: bool = False
+    primary_image_url: Optional[str] = None
+    description: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
     created_at: Optional[datetime] = None
     unit_types: List[UnitTypeBase] = []  # Nested units
 

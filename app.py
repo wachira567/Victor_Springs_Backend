@@ -525,9 +525,17 @@ def update_property(
 
         # Update fields
         for key, value in property_data.items():
-            if hasattr(property_obj, key):
-                if key in ['latitude', 'longitude'] and value is not None:
-                    setattr(property_obj, key, float(value))
+            if hasattr(property_obj, key) and value is not None:
+                if key in ['latitude', 'longitude']:
+                    if str(value).strip():
+                        try:
+                            setattr(property_obj, key, float(value))
+                        except (ValueError, TypeError):
+                            # Skip invalid numeric values
+                            pass
+                    else:
+                        # Empty string, set to None
+                        setattr(property_obj, key, None)
                 else:
                     setattr(property_obj, key, value)
 
