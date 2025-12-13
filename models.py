@@ -189,6 +189,12 @@ class Appointment(Base):
     status = Column(Enum(AppointmentStatus), default=AppointmentStatus.pending)
     type = Column(Enum(BookingIntent), default=BookingIntent.viewing)
 
+    # Guest contact information (for when user_id is null)
+    guest_name = Column(String, nullable=True)
+    guest_email = Column(String, nullable=True)
+    guest_phone = Column(String, nullable=True)
+
+    number_of_people = Column(Integer, default=1)  # Number of people in the visit
     admin_notes = Column(Text)
     created_at = Column(DateTime, default=datetime.now)
 

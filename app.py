@@ -1079,6 +1079,10 @@ def create_site_visit(
             appointment_date=appointment_datetime,
             status=AppointmentStatus.pending,
             type=BookingIntent.viewing,
+            # Store guest contact info if this is a guest booking
+            guest_name=request.get("contact_name") if not user_id else None,
+            guest_email=request.get("contact_email") if not user_id else None,
+            guest_phone=request.get("contact_phone") if not user_id else None,
             admin_notes=f"Site visit request: {request.get('special_requests', '')}",
         )
 
@@ -1222,7 +1226,7 @@ def send_custom_notification_endpoint(
             message_content=message,
             recipient_phone=phone,
             delivery_method="pending",
-            success=False  # Will be updated when actually sent
+            success=False,  # Will be updated when actually sent
         )
         db.add(log_entry)
         db.commit()
@@ -1995,6 +1999,38 @@ def get_user_interests(Authorization: str = Header(...), db: Session = Depends(g
                 if property_obj:
                     property_name = property_obj.name or "Unknown Property"
 
+                    # Get primary image for the property
+                    primary_image = None
+                    if property_obj.unit_types:
+                        for ut in property_obj.unit_types:
+                            if ut.images:
+                                primary_img = next(
+                                    (img for img in ut.images if img.is_primary), None
+                                )
+                                if primary_img:
+                                    primary_image = primary_img.image_url
+                                    break
+                                elif ut.images:
+                                    # If no primary, use first image
+                                    primary_image = ut.images[0].image_url
+                                    break
+
+                    # Get primary image for the property
+                    primary_image = None
+                    if property_obj.unit_types:
+                        for ut in property_obj.unit_types:
+                            if ut.images:
+                                primary_img = next(
+                                    (img for img in ut.images if img.is_primary), None
+                                )
+                                if primary_img:
+                                    primary_image = primary_img.image_url
+                                    break
+                                elif ut.images:
+                                    # If no primary, use first image
+                                    primary_image = ut.images[0].image_url
+                                    break
+
             result.append(
                 {
                     "id": interest.id,
@@ -2014,6 +2050,11 @@ def get_user_interests(Authorization: str = Header(...), db: Session = Depends(g
                     if interest.created_at
                     else None,
                     "is_active": interest.is_active,
+                    "primary_image": primary_image,
+                    "valid_until": interest.valid_until.isoformat()
+                    if interest.valid_until
+                    else None,
+                    "notifications": [],
                 }
             )
 
@@ -2063,6 +2104,7 @@ def get_user_appointments(
             )
             property_name = "Unknown Property"
             unit_type_name = "Unknown Unit"
+            primary_image = None
 
             if unit_type:
                 unit_type_name = unit_type.name or "Unknown Unit"
@@ -2074,6 +2116,21 @@ def get_user_appointments(
                 if property_obj:
                     property_name = property_obj.name or "Unknown Property"
 
+                    # Get primary image for the property
+                    if property_obj.unit_types:
+                        for ut in property_obj.unit_types:
+                            if ut.images:
+                                primary_img = next(
+                                    (img for img in ut.images if img.is_primary), None
+                                )
+                                if primary_img:
+                                    primary_image = primary_img.image_url
+                                    break
+                                elif ut.images:
+                                    # If no primary, use first image
+                                    primary_image = ut.images[0].image_url
+                                    break
+
             appointment_dict = {
                 "id": appointment.id,
                 "user_id": appointment.user_id,
@@ -2081,7 +2138,13 @@ def get_user_appointments(
                 "appointment_date": appointment.appointment_date.isoformat()
                 if appointment.appointment_date
                 else None,
-                "status": appointment.status.value if appointment.status else "Pending",
+                "status": "Approved"
+                if appointment.status and appointment.status.value == "confirmed"
+                else (
+                    "Rejected"
+                    if appointment.status and appointment.status.value == "cancelled"
+                    else "Pending"
+                ),
                 "type": appointment.type.value if appointment.type else "viewing",
                 "admin_notes": appointment.admin_notes,
                 "created_at": appointment.created_at.isoformat()
@@ -2089,6 +2152,7 @@ def get_user_appointments(
                 else None,
                 "unit_type_name": unit_type_name,
                 "property_name": property_name,
+                "primary_image": primary_image,
             }
             result.append(appointment_dict)
 
@@ -2190,14 +2254,18 @@ def get_property_interests(
 
                 notifications = []
                 for log in notification_history:
-                    notifications.append({
-                        "id": log.id,
-                        "message_type": log.message_type,
-                        "message_content": log.message_content[:100] + "..." if len(log.message_content or "") > 100 else log.message_content,
-                        "delivery_method": log.delivery_method,
-                        "sent_at": log.sent_at.isoformat() if log.sent_at else None,
-                        "success": log.success,
-                    })
+                    notifications.append(
+                        {
+                            "id": log.id,
+                            "message_type": log.message_type,
+                            "message_content": log.message_content[:100] + "..."
+                            if len(log.message_content or "") > 100
+                            else log.message_content,
+                            "delivery_method": log.delivery_method,
+                            "sent_at": log.sent_at.isoformat() if log.sent_at else None,
+                            "success": log.success,
+                        }
+                    )
 
                 result.append(
                     {
@@ -2216,7 +2284,9 @@ def get_property_interests(
                         "timeframe_months": timeframe_months,
                         "special_requests": interest.special_requests,
                         "created_at": created_at_str,
-                        "valid_until": interest.valid_until.isoformat() if interest.valid_until else None,
+                        "valid_until": interest.valid_until.isoformat()
+                        if interest.valid_until
+                        else None,
                         "is_active": interest.is_active,
                         "notifications": notifications,
                     }
@@ -2301,25 +2371,18 @@ def get_site_visits(
                 contact_phone = appointment.user.phone_number
                 is_guest = False
             else:
-                # For guests, we don't have stored contact info, so we'll show "Guest"
-                contact_name = "Guest User"
-                contact_email = "N/A"
-                contact_phone = "N/A"
+                # For guests, use stored guest contact info
+                contact_name = appointment.guest_name or "Guest User"
+                contact_email = appointment.guest_email or "N/A"
+                contact_phone = appointment.guest_phone or "N/A"
                 is_guest = True
-            # Get contact info from user or guest
-            contact_name = ""
-            contact_email = ""
-            contact_phone = ""
 
-            if appointment.user:
-                contact_name = f"{appointment.user.first_name} {appointment.user.last_name}".strip()
-                contact_email = appointment.user.email
-                contact_phone = appointment.user.phone_number
-            else:
-                # For guests, we don't have stored contact info, so we'll show "Guest"
-                contact_name = "Guest User"
-                contact_email = "N/A"
-                contact_phone = "N/A"
+            # Format date and time separately
+            appointment_date = None
+            appointment_time = None
+            if appointment.appointment_date:
+                appointment_date = appointment.appointment_date.strftime("%Y-%m-%d")
+                appointment_time = appointment.appointment_date.strftime("%H:%M")
 
             result.append(
                 {
@@ -2331,9 +2394,8 @@ def get_site_visits(
                     "contact_name": contact_name,
                     "contact_email": contact_email,
                     "contact_phone": contact_phone,
-                    "appointment_date": appointment.appointment_date.isoformat()
-                    if appointment.appointment_date
-                    else None,
+                    "appointment_date": appointment_date,
+                    "appointment_time": appointment_time,
                     "status": appointment.status.value
                     if appointment.status
                     else "pending",
@@ -2386,6 +2448,13 @@ def get_guest_site_visits(
                         appointment.unit_type.property.name or "Unknown Property"
                     )
 
+            # Format date and time separately
+            appointment_date = None
+            appointment_time = None
+            if appointment.appointment_date:
+                appointment_date = appointment.appointment_date.strftime("%Y-%m-%d")
+                appointment_time = appointment.appointment_date.strftime("%H:%M")
+
             result.append(
                 {
                     "id": appointment.id,
@@ -2393,12 +2462,11 @@ def get_guest_site_visits(
                     "guest_id": appointment.guest_id,
                     "property_name": property_name,
                     "unit_type_name": unit_type_name,
-                    "contact_name": "Guest User",
-                    "contact_email": "N/A",
-                    "contact_phone": "N/A",
-                    "appointment_date": appointment.appointment_date.isoformat()
-                    if appointment.appointment_date
-                    else None,
+                    "contact_name": appointment.guest_name or "Guest User",
+                    "contact_email": appointment.guest_email or "N/A",
+                    "contact_phone": appointment.guest_phone or "N/A",
+                    "appointment_date": appointment_date,
+                    "appointment_time": appointment_time,
                     "status": appointment.status.value
                     if appointment.status
                     else "pending",
@@ -2462,6 +2530,13 @@ def get_user_site_visits(
                 contact_email = appointment.user.email
                 contact_phone = appointment.user.phone_number
 
+            # Format date and time separately
+            appointment_date = None
+            appointment_time = None
+            if appointment.appointment_date:
+                appointment_date = appointment.appointment_date.strftime("%Y-%m-%d")
+                appointment_time = appointment.appointment_date.strftime("%H:%M")
+
             result.append(
                 {
                     "id": appointment.id,
@@ -2472,9 +2547,8 @@ def get_user_site_visits(
                     "contact_name": contact_name,
                     "contact_email": contact_email,
                     "contact_phone": contact_phone,
-                    "appointment_date": appointment.appointment_date.isoformat()
-                    if appointment.appointment_date
-                    else None,
+                    "appointment_date": appointment_date,
+                    "appointment_time": appointment_time,
                     "status": appointment.status.value
                     if appointment.status
                     else "pending",
@@ -2503,7 +2577,6 @@ def approve_site_visit(
     appointment_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-    background_tasks: BackgroundTasks = None,
 ):
     """Approve a site visit and send confirmation notification"""
     if current_user.role.value != "admin":
@@ -2520,33 +2593,40 @@ def approve_site_visit(
         appointment.status = AppointmentStatus.confirmed
         db.commit()
 
-        # Send confirmation notification if we have contact info
-        if background_tasks:
-            # Get contact info
-            contact_name = ""
-            contact_phone = ""
+        # Send confirmation notification synchronously
+        # Get contact info for both users and guests
+        contact_name = ""
+        contact_phone = ""
 
-            if appointment.user:
-                contact_name = f"{appointment.user.first_name} {appointment.user.last_name}".strip()
-                contact_phone = appointment.user.phone_number
-            # For guests, we don't have stored contact info, so skip notification
+        if appointment.user:
+            # Registered user
+            contact_name = (
+                f"{appointment.user.first_name} {appointment.user.last_name}".strip()
+            )
+            contact_phone = appointment.user.phone_number
+        else:
+            # Guest user - use stored guest contact info
+            contact_name = appointment.guest_name or "Valued Customer"
+            contact_phone = appointment.guest_phone
 
-            if contact_phone and contact_name:
-                site_visit_data = {
-                    "contact_name": contact_name,
-                    "visit_date": appointment.appointment_date.strftime("%Y-%m-%d"),
-                    "visit_time": appointment.appointment_date.strftime("%H:%M"),
-                    "property_name": appointment.unit_type.property.name,
-                    "property_address": f"{appointment.unit_type.property.address}, {appointment.unit_type.property.city}"
-                    if appointment.unit_type.property.address
-                    else f"{appointment.unit_type.property.city}",
-                }
+        if contact_phone and contact_name:
+            site_visit_data = {
+                "contact_name": contact_name,
+                "visit_date": appointment.appointment_date.strftime("%Y-%m-%d"),
+                "visit_time": appointment.appointment_date.strftime("%H:%M"),
+                "property_name": appointment.unit_type.property.name,
+                "property_address": f"{appointment.unit_type.property.address}, {appointment.unit_type.property.city}"
+                if appointment.unit_type.property.address
+                else f"{appointment.unit_type.property.city}",
+            }
 
-                background_tasks.add_task(
-                    send_site_visit_confirmation_notification,
-                    contact_phone,
-                    site_visit_data,
+            try:
+                success, method = send_site_visit_confirmation_notification(
+                    contact_phone, site_visit_data
                 )
+                print(f"Site visit confirmation sent via {method}: {success}")
+            except Exception as e:
+                print(f"Failed to send site visit confirmation: {e}")
 
         return {"message": "Site visit approved successfully"}
     except HTTPException:
